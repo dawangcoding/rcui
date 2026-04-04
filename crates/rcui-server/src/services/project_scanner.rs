@@ -42,7 +42,7 @@ pub struct SessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom_name: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -348,7 +348,7 @@ pub async fn get_claude_sessions(
             provider: "claude".to_string(),
             is_grouped: None,
             group_size: None,
-            custom_name: None,
+            name: None,
         })
         .collect();
 
@@ -405,7 +405,7 @@ pub async fn get_cursor_sessions(project_path: &str) -> Vec<SessionInfo> {
             provider: "cursor".to_string(),
             is_grouped: None,
             group_size: None,
-            custom_name: None,
+            name: None,
         });
     }
 
@@ -486,7 +486,7 @@ pub async fn get_codex_sessions(
             provider: "codex".to_string(),
             is_grouped: None,
             group_size: None,
-            custom_name: None,
+            name: None,
         });
     }
 
@@ -573,7 +573,7 @@ pub async fn get_gemini_cli_sessions(project_path: &str) -> Vec<SessionInfo> {
                 provider: "gemini".to_string(),
                 is_grouped: None,
                 group_size: None,
-                custom_name: None,
+                name: None,
             });
         }
     }

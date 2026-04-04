@@ -191,6 +191,26 @@ impl ChatResponse {
     }
 }
 
+// ─── Stderr Drain Helper ─────────────────────────────────────────────────────
+
+/// Spawn a background task to drain a child process's stderr, preventing pipe
+/// buffer deadlock. Lines are logged at warn level for diagnostics.
+fn drain_stderr(stderr: tokio::process::ChildStderr, provider: &'static str) {
+    tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                warn!(provider, stderr = %trimmed, "CLI stderr");
+            }
+        }
+    });
+}
+
+/// Inactivity timeout for CLI processes (120 seconds).
+const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 // ─── Provider CLI Execution ──────────────────────────────────────────────────
 
 /// Execute a chat command by dispatching to the appropriate provider.
@@ -214,15 +234,15 @@ pub async fn execute_command(
             if opts.session_id.is_none() {
                 opts.session_id = session_id;
             }
-            spawn_cursor(command, opts, tx).await;
+            spawn_cursor(command, opts, tx, state).await;
         }
         ChatCommand::CodexCommand { command, options } => {
             info!(provider = "codex", cwd = ?options.cwd, "Executing command");
-            spawn_codex(command, options, tx).await;
+            spawn_codex(command, options, tx, state).await;
         }
         ChatCommand::GeminiCommand { command, options } => {
             info!(provider = "gemini", cwd = ?options.cwd, "Executing command");
-            spawn_gemini(command, options, tx).await;
+            spawn_gemini(command, options, tx, state).await;
         }
         ChatCommand::AbortSession {
             session_id,
@@ -263,8 +283,6 @@ pub async fn execute_command(
             });
         }
         ChatCommand::GetPendingPermissions { session_id } => {
-            // Permission management would require a more complex state machine
-            // For now, return empty list
             let _ = tx.send(ChatResponse {
                 kind: "pending_permissions".to_string(),
                 session_id: Some(session_id),
@@ -275,7 +293,6 @@ pub async fn execute_command(
         }
         ChatCommand::ClaudePermissionResponse { .. } => {
             // Permission responses need to be forwarded to the Claude process stdin
-            // This will be enhanced when we add stdin writing support
         }
     }
 }
@@ -298,6 +315,7 @@ async fn spawn_claude(
     let mut args: Vec<String> = vec![
         "--output-format".to_string(),
         "stream-json".to_string(),
+        "--verbose".to_string(),
         "-p".to_string(),
         prompt,
     ];
@@ -330,6 +348,7 @@ async fn spawn_claude(
     let result = Command::new("claude")
         .args(&args)
         .current_dir(cwd)
+        .env("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -357,6 +376,11 @@ async fn spawn_claude(
         }
     };
 
+    // Drain stderr to prevent pipe buffer deadlock
+    if let Some(stderr) = child.stderr.take() {
+        drain_stderr(stderr, "claude");
+    }
+
     // Register active session
     let session_key = format!("{provider}:pending");
     let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel();
@@ -371,10 +395,12 @@ async fn spawn_claude(
     let mut session_id = String::new();
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
+    let mut last_activity = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
             line_result = lines.next_line() => {
+                last_activity = tokio::time::Instant::now();
                 match line_result {
                     Ok(Some(line)) => {
                         let trimmed = line.trim();
@@ -431,13 +457,25 @@ async fn spawn_claude(
                 state.active_sessions.remove(&format!("{provider}:{session_id}"));
                 return;
             }
+            _ = tokio::time::sleep_until(last_activity + INACTIVITY_TIMEOUT) => {
+                warn!(provider, %session_id, "Session timed out (120s inactivity)");
+                let _ = tx.send(ChatResponse::error(
+                    "Session timed out (120s inactivity)",
+                    Some(&session_id),
+                    provider,
+                ));
+                break;
+            }
         }
     }
 
-    // Process finished
-    state
-        .active_sessions
-        .remove(&format!("{provider}:{session_id}"));
+    // Process finished — clean up active session
+    let real_key = if session_id.is_empty() {
+        session_key
+    } else {
+        format!("{provider}:{session_id}")
+    };
+    state.active_sessions.remove(&real_key);
     info!(provider, %session_id, exit_code = 0, "Process completed");
     let _ = tx.send(ChatResponse::complete(&session_id, provider, 0, false));
 }
@@ -534,6 +572,7 @@ async fn spawn_cursor(
     prompt: String,
     opts: CommandOptions,
     tx: mpsc::UnboundedSender<ChatResponse>,
+    state: Arc<AppState>,
 ) {
     let provider = "cursor";
     let cwd = opts
@@ -598,81 +637,135 @@ async fn spawn_cursor(
         }
     };
 
+    // Drain stderr to prevent pipe buffer deadlock
+    if let Some(stderr) = child.stderr.take() {
+        drain_stderr(stderr, "cursor");
+    }
+
+    // Register active session with abort support
+    let session_key = format!("{provider}:pending");
+    let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel();
+    state.active_sessions.insert(
+        session_key.clone(),
+        Arc::new(tokio::sync::Mutex::new(crate::state::ActiveSession {
+            child,
+            abort_tx,
+        })),
+    );
+
     let mut session_id = opts.session_id.clone().unwrap_or_default();
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
+    let mut last_activity = tokio::time::Instant::now();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    loop {
+        tokio::select! {
+            line_result = lines.next_line() => {
+                last_activity = tokio::time::Instant::now();
+                match line_result {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
 
-        if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
-            let msg_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+                            let msg_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            match msg_type {
-                "system" => {
-                    // System init message — capture session ID
-                    if let Some(sid) = event.get("sessionId").and_then(|v| v.as_str()) {
-                        session_id = sid.to_string();
-                        info!(provider, %session_id, "Session created");
-                        let _ = tx.send(ChatResponse::session_created(&session_id, provider));
+                            match msg_type {
+                                "system" => {
+                                    if let Some(sid) = event.get("sessionId").and_then(|v| v.as_str()) {
+                                        session_id = sid.to_string();
+                                        info!(provider, %session_id, "Session created");
+                                        // Re-register with real session ID
+                                        if let Some((_, session)) = state.active_sessions.remove(&session_key) {
+                                            state.active_sessions.insert(
+                                                format!("{provider}:{session_id}"),
+                                                session,
+                                            );
+                                        }
+                                        let _ = tx.send(ChatResponse::session_created(&session_id, provider));
+                                    }
+                                }
+                                "assistant" | "text" => {
+                                    let content = event
+                                        .get("content")
+                                        .or(event.get("text"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !content.is_empty() {
+                                        let _ = tx.send(ChatResponse::stream_delta(content, &session_id, provider));
+                                    }
+                                }
+                                "result" => {
+                                    if let Some(text) = event.get("result").and_then(|v| v.as_str()) {
+                                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                                    }
+                                }
+                                "error" => {
+                                    let msg = event
+                                        .get("error")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("Cursor error");
+                                    warn!(provider, %session_id, %msg, "Stream error event");
+                                    let _ = tx.send(ChatResponse::error(msg, Some(&session_id), provider));
+                                }
+                                _ => {
+                                    if let Some(text) = event.get("content").and_then(|v| v.as_str()) {
+                                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                                    }
+                                }
+                            }
+                        } else {
+                            // Non-JSON line: treat as raw text output
+                            if !session_id.is_empty() {
+                                let _ = tx.send(ChatResponse::stream_delta(trimmed, &session_id, provider));
+                            }
+                        }
                     }
-                }
-                "assistant" | "text" => {
-                    let content = event
-                        .get("content")
-                        .or(event.get("text"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !content.is_empty() {
-                        let _ =
-                            tx.send(ChatResponse::stream_delta(content, &session_id, provider));
+                    Ok(None) => {
+                        debug!(provider, %session_id, "Stream EOF");
+                        break;
                     }
-                }
-                "result" => {
-                    if let Some(text) = event.get("result").and_then(|v| v.as_str()) {
-                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
-                    }
-                }
-                "error" => {
-                    let msg = event
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Cursor error");
-                    warn!(provider, %session_id, %msg, "Stream error event");
-                    let _ = tx.send(ChatResponse::error(msg, Some(&session_id), provider));
-                }
-                _ => {
-                    // Unknown JSON event — pass content if available
-                    if let Some(text) = event.get("content").and_then(|v| v.as_str()) {
-                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                    Err(e) => {
+                        error!(provider, %session_id, error = %e, "Stream read error");
+                        let _ = tx.send(ChatResponse::error(
+                            &format!("Read error: {e}"),
+                            Some(&session_id),
+                            provider,
+                        ));
+                        break;
                     }
                 }
             }
-        } else {
-            // Non-JSON line: treat as raw text output
-            if !session_id.is_empty() {
-                let _ = tx.send(ChatResponse::stream_delta(trimmed, &session_id, provider));
+            _ = &mut abort_rx => {
+                info!(provider, %session_id, "Session aborted");
+                let _ = tx.send(ChatResponse::complete(&session_id, provider, 1, true));
+                let real_key = if session_id.is_empty() { &session_key } else { &format!("{provider}:{session_id}") };
+                state.active_sessions.remove(real_key);
+                return;
+            }
+            _ = tokio::time::sleep_until(last_activity + INACTIVITY_TIMEOUT) => {
+                warn!(provider, %session_id, "Session timed out (120s inactivity)");
+                let _ = tx.send(ChatResponse::error(
+                    "Session timed out (120s inactivity)",
+                    Some(&session_id),
+                    provider,
+                ));
+                break;
             }
         }
     }
 
-    // Wait for process exit
-    let exit_code = match child.wait().await {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(_) => 1,
+    // Process finished — clean up active session
+    let real_key = if session_id.is_empty() {
+        session_key
+    } else {
+        format!("{provider}:{session_id}")
     };
-
-    info!(provider, %session_id, exit_code, "Process completed");
-
-    let _ = tx.send(ChatResponse::complete(
-        &session_id,
-        provider,
-        exit_code,
-        false,
-    ));
+    state.active_sessions.remove(&real_key);
+    info!(provider, %session_id, exit_code = 0, "Process completed");
+    let _ = tx.send(ChatResponse::complete(&session_id, provider, 0, false));
 }
 
 // ─── Codex CLI Spawner ──────────────────────────────────────────────────────
@@ -681,6 +774,7 @@ async fn spawn_codex(
     prompt: String,
     opts: CommandOptions,
     tx: mpsc::UnboundedSender<ChatResponse>,
+    state: Arc<AppState>,
 ) {
     let provider = "codex";
     let cwd = opts
@@ -742,6 +836,11 @@ async fn spawn_codex(
         }
     };
 
+    // Drain stderr to prevent pipe buffer deadlock
+    if let Some(stderr) = child.stderr.take() {
+        drain_stderr(stderr, "codex");
+    }
+
     let session_id = opts
         .session_id
         .clone()
@@ -749,107 +848,129 @@ async fn spawn_codex(
     info!(provider, %session_id, "Session created");
     let _ = tx.send(ChatResponse::session_created(&session_id, provider));
 
+    // Register active session with abort support
+    let session_key = format!("{provider}:{session_id}");
+    let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel();
+    state.active_sessions.insert(
+        session_key.clone(),
+        Arc::new(tokio::sync::Mutex::new(crate::state::ActiveSession {
+            child,
+            abort_tx,
+        })),
+    );
+
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
+    let mut last_activity = tokio::time::Instant::now();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    loop {
+        tokio::select! {
+            line_result = lines.next_line() => {
+                last_activity = tokio::time::Instant::now();
+                match line_result {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
 
-        if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
-            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+                            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            match event_type {
-                "item" => {
-                    // SDK event format
-                    if let Some(item) = event.get("item") {
-                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        match item_type {
-                            "message" => {
-                                if let Some(content) =
-                                    item.get("content").and_then(|v| v.as_array())
-                                {
-                                    for part in content {
-                                        if let Some(text) =
-                                            part.get("text").and_then(|v| v.as_str())
-                                        {
-                                            let _ = tx.send(ChatResponse::stream_delta(
-                                                text,
-                                                &session_id,
-                                                provider,
-                                            ));
+                            match event_type {
+                                "item" => {
+                                    if let Some(item) = event.get("item") {
+                                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                        match item_type {
+                                            "message" => {
+                                                if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                                                    for part in content {
+                                                        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                                            let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            "function_call" => {
+                                                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                                let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                                                debug!(provider, %session_id, %name, "Tool use event");
+                                                let _ = tx.send(ChatResponse {
+                                                    kind: "tool_use".to_string(),
+                                                    tool_name: Some(name.to_string()),
+                                                    tool_input: serde_json::from_str(arguments).ok(),
+                                                    session_id: Some(session_id.clone()),
+                                                    provider: provider.to_string(),
+                                                    ..ChatResponse::empty()
+                                                });
+                                            }
+                                            "function_call_output" => {
+                                                let output = item.get("output").cloned();
+                                                let _ = tx.send(ChatResponse {
+                                                    kind: "tool_result".to_string(),
+                                                    tool_result: output,
+                                                    session_id: Some(session_id.clone()),
+                                                    provider: provider.to_string(),
+                                                    ..ChatResponse::empty()
+                                                });
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
+                                "error" => {
+                                    let msg = event.get("message").and_then(|v| v.as_str()).unwrap_or("Codex error");
+                                    warn!(provider, %session_id, %msg, "Stream error event");
+                                    let _ = tx.send(ChatResponse::error(msg, Some(&session_id), provider));
+                                }
+                                _ => {
+                                    if let Some(text) = event.get("content").and_then(|v| v.as_str()) {
+                                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                                    }
+                                }
                             }
-                            "function_call" => {
-                                let name = item
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                let arguments = item
-                                    .get("arguments")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                debug!(provider, %session_id, %name, "Tool use event");
-                                let _ = tx.send(ChatResponse {
-                                    kind: "tool_use".to_string(),
-                                    tool_name: Some(name.to_string()),
-                                    tool_input: serde_json::from_str(arguments).ok(),
-                                    session_id: Some(session_id.clone()),
-                                    provider: provider.to_string(),
-                                    ..ChatResponse::empty()
-                                });
-                            }
-                            "function_call_output" => {
-                                let output = item.get("output").cloned();
-                                let _ = tx.send(ChatResponse {
-                                    kind: "tool_result".to_string(),
-                                    tool_result: output,
-                                    session_id: Some(session_id.clone()),
-                                    provider: provider.to_string(),
-                                    ..ChatResponse::empty()
-                                });
-                            }
-                            _ => {}
+                        } else {
+                            // Raw text
+                            let _ = tx.send(ChatResponse::stream_delta(trimmed, &session_id, provider));
                         }
                     }
-                }
-                "error" => {
-                    let msg = event
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Codex error");
-                    warn!(provider, %session_id, %msg, "Stream error event");
-                    let _ = tx.send(ChatResponse::error(msg, Some(&session_id), provider));
-                }
-                _ => {
-                    if let Some(text) = event.get("content").and_then(|v| v.as_str()) {
-                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                    Ok(None) => {
+                        debug!(provider, %session_id, "Stream EOF");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(provider, %session_id, error = %e, "Stream read error");
+                        let _ = tx.send(ChatResponse::error(
+                            &format!("Read error: {e}"),
+                            Some(&session_id),
+                            provider,
+                        ));
+                        break;
                     }
                 }
             }
-        } else {
-            // Raw text
-            let _ = tx.send(ChatResponse::stream_delta(trimmed, &session_id, provider));
+            _ = &mut abort_rx => {
+                info!(provider, %session_id, "Session aborted");
+                let _ = tx.send(ChatResponse::complete(&session_id, provider, 1, true));
+                state.active_sessions.remove(&session_key);
+                return;
+            }
+            _ = tokio::time::sleep_until(last_activity + INACTIVITY_TIMEOUT) => {
+                warn!(provider, %session_id, "Session timed out (120s inactivity)");
+                let _ = tx.send(ChatResponse::error(
+                    "Session timed out (120s inactivity)",
+                    Some(&session_id),
+                    provider,
+                ));
+                break;
+            }
         }
     }
 
-    let exit_code = match child.wait().await {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(_) => 1,
-    };
-
-    info!(provider, %session_id, exit_code, "Process completed");
-
-    let _ = tx.send(ChatResponse::complete(
-        &session_id,
-        provider,
-        exit_code,
-        false,
-    ));
+    // Process finished — clean up active session
+    state.active_sessions.remove(&session_key);
+    info!(provider, %session_id, exit_code = 0, "Process completed");
+    let _ = tx.send(ChatResponse::complete(&session_id, provider, 0, false));
 }
 
 // ─── Gemini CLI Spawner ─────────────────────────────────────────────────────
@@ -858,6 +979,7 @@ async fn spawn_gemini(
     prompt: String,
     opts: CommandOptions,
     tx: mpsc::UnboundedSender<ChatResponse>,
+    state: Arc<AppState>,
 ) {
     let provider = "gemini";
     let cwd = opts
@@ -925,6 +1047,11 @@ async fn spawn_gemini(
         }
     };
 
+    // Drain stderr to prevent pipe buffer deadlock
+    if let Some(stderr) = child.stderr.take() {
+        drain_stderr(stderr, "gemini");
+    }
+
     let session_id = opts
         .session_id
         .clone()
@@ -932,136 +1059,125 @@ async fn spawn_gemini(
     info!(provider, %session_id, "Session created");
     let _ = tx.send(ChatResponse::session_created(&session_id, provider));
 
+    // Register active session with abort support
+    let session_key = format!("{provider}:{session_id}");
+    let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel();
+    state.active_sessions.insert(
+        session_key.clone(),
+        Arc::new(tokio::sync::Mutex::new(crate::state::ActiveSession {
+            child,
+            abort_tx,
+        })),
+    );
+
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
 
-    // Timeout: 120 seconds of inactivity
-    let timeout_duration = std::time::Duration::from_secs(120);
-
     loop {
-        match tokio::time::timeout(timeout_duration, lines.next_line()).await {
-            Ok(Ok(Some(line))) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
+        tokio::select! {
+            line_result = tokio::time::timeout(INACTIVITY_TIMEOUT, lines.next_line()) => {
+                match line_result {
+                    Ok(Ok(Some(line))) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
 
-                if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
-                    let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+                            let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                    match kind {
-                        "message" | "delta" | "content" => {
-                            let text = event
-                                .get("content")
-                                .or(event.get("text"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if !text.is_empty() {
-                                let _ = tx.send(ChatResponse::stream_delta(
-                                    text,
-                                    &session_id,
-                                    provider,
-                                ));
+                            match kind {
+                                "message" | "delta" | "content" => {
+                                    let text = event
+                                        .get("content")
+                                        .or(event.get("text"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !text.is_empty() {
+                                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                                    }
+                                }
+                                "tool_use" => {
+                                    let name = event.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                    let input = event.get("input").cloned().unwrap_or(Value::Null);
+                                    debug!(provider, %session_id, %name, "Tool use event");
+                                    let _ = tx.send(ChatResponse {
+                                        kind: "tool_use".to_string(),
+                                        tool_name: Some(name.to_string()),
+                                        tool_input: Some(input),
+                                        session_id: Some(session_id.clone()),
+                                        provider: provider.to_string(),
+                                        ..ChatResponse::empty()
+                                    });
+                                }
+                                "tool_result" => {
+                                    let result = event.get("output").cloned();
+                                    let _ = tx.send(ChatResponse {
+                                        kind: "tool_result".to_string(),
+                                        tool_result: result,
+                                        session_id: Some(session_id.clone()),
+                                        provider: provider.to_string(),
+                                        ..ChatResponse::empty()
+                                    });
+                                }
+                                "result" => {
+                                    if let Some(text) = event.get("result").and_then(|v| v.as_str()) {
+                                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                                    }
+                                }
+                                "error" => {
+                                    let msg = event.get("error").and_then(|v| v.as_str()).unwrap_or("Gemini error");
+                                    warn!(provider, %session_id, %msg, "Stream error event");
+                                    let _ = tx.send(ChatResponse::error(msg, Some(&session_id), provider));
+                                }
+                                _ => {
+                                    if let Some(text) = event.get("content").and_then(|v| v.as_str()) {
+                                        let _ = tx.send(ChatResponse::stream_delta(text, &session_id, provider));
+                                    }
+                                }
                             }
-                        }
-                        "tool_use" => {
-                            let name = event
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            let input = event.get("input").cloned().unwrap_or(Value::Null);
-                            debug!(provider, %session_id, %name, "Tool use event");
-                            let _ = tx.send(ChatResponse {
-                                kind: "tool_use".to_string(),
-                                tool_name: Some(name.to_string()),
-                                tool_input: Some(input),
-                                session_id: Some(session_id.clone()),
-                                provider: provider.to_string(),
-                                ..ChatResponse::empty()
-                            });
-                        }
-                        "tool_result" => {
-                            let result = event.get("output").cloned();
-                            let _ = tx.send(ChatResponse {
-                                kind: "tool_result".to_string(),
-                                tool_result: result,
-                                session_id: Some(session_id.clone()),
-                                provider: provider.to_string(),
-                                ..ChatResponse::empty()
-                            });
-                        }
-                        "result" => {
-                            if let Some(text) = event.get("result").and_then(|v| v.as_str()) {
-                                let _ = tx.send(ChatResponse::stream_delta(
-                                    text,
-                                    &session_id,
-                                    provider,
-                                ));
-                            }
-                        }
-                        "error" => {
-                            let msg = event
-                                .get("error")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Gemini error");
-                            warn!(provider, %session_id, %msg, "Stream error event");
-                            let _ =
-                                tx.send(ChatResponse::error(msg, Some(&session_id), provider));
-                        }
-                        _ => {
-                            if let Some(text) = event.get("content").and_then(|v| v.as_str()) {
-                                let _ = tx.send(ChatResponse::stream_delta(
-                                    text,
-                                    &session_id,
-                                    provider,
-                                ));
-                            }
+                        } else {
+                            let _ = tx.send(ChatResponse::stream_delta(trimmed, &session_id, provider));
                         }
                     }
-                } else {
-                    let _ = tx.send(ChatResponse::stream_delta(trimmed, &session_id, provider));
+                    Ok(Ok(None)) => {
+                        debug!(provider, %session_id, "Stream EOF");
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        error!(provider, %session_id, error = %e, "Stream read error");
+                        let _ = tx.send(ChatResponse::error(
+                            &format!("Read error: {e}"),
+                            Some(&session_id),
+                            provider,
+                        ));
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout
+                        warn!(provider, %session_id, "Session timed out (120s inactivity)");
+                        let _ = tx.send(ChatResponse::error(
+                            "Session timed out (120s inactivity)",
+                            Some(&session_id),
+                            provider,
+                        ));
+                        break;
+                    }
                 }
             }
-            Ok(Ok(None)) => {
-                debug!(provider, %session_id, "Stream EOF");
-                break;
-            }
-            Ok(Err(e)) => {
-                error!(provider, %session_id, error = %e, "Stream read error");
-                let _ = tx.send(ChatResponse::error(
-                    &format!("Read error: {e}"),
-                    Some(&session_id),
-                    provider,
-                ));
-                break;
-            }
-            Err(_) => {
-                // Timeout
-                warn!(provider, %session_id, "Session timed out (120s inactivity)");
-                let _ = tx.send(ChatResponse::error(
-                    "Gemini session timed out (120s inactivity)",
-                    Some(&session_id),
-                    provider,
-                ));
-                let _ = child.kill().await;
-                break;
+            _ = &mut abort_rx => {
+                info!(provider, %session_id, "Session aborted");
+                let _ = tx.send(ChatResponse::complete(&session_id, provider, 1, true));
+                state.active_sessions.remove(&session_key);
+                return;
             }
         }
     }
 
-    let exit_code = match child.wait().await {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(_) => 1,
-    };
-
-    info!(provider, %session_id, exit_code, "Process completed");
-
-    let _ = tx.send(ChatResponse::complete(
-        &session_id,
-        provider,
-        exit_code,
-        false,
-    ));
+    // Process finished — clean up active session
+    state.active_sessions.remove(&session_key);
+    info!(provider, %session_id, exit_code = 0, "Process completed");
+    let _ = tx.send(ChatResponse::complete(&session_id, provider, 0, false));
 }
 
 // ─── Abort ──────────────────────────────────────────────────────────────────

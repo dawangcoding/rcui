@@ -55,7 +55,7 @@ pub async fn delete_api_key(
     State(state): State<Arc<AppState>>,
     Path(key_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    let deleted = db::api_keys::delete(&state.db, auth.user_id, key_id).await?;
+    let deleted = db::api_keys::delete(&state.db, key_id, auth.user_id).await?;
     if deleted {
         Ok(Json(json!({ "success": true })))
     } else {
@@ -75,7 +75,7 @@ pub async fn toggle_api_key(
     Path(key_id): Path<i64>,
     Json(body): Json<ToggleRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let toggled = db::api_keys::toggle(&state.db, auth.user_id, key_id, body.is_active).await?;
+    let toggled = db::api_keys::toggle(&state.db, key_id, auth.user_id, body.is_active).await?;
     if toggled {
         Ok(Json(json!({ "success": true })))
     } else {
@@ -147,7 +147,7 @@ pub async fn delete_credential(
     State(state): State<Arc<AppState>>,
     Path(credential_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    let deleted = db::credentials::delete(&state.db, auth.user_id, credential_id).await?;
+    let deleted = db::credentials::delete(&state.db, credential_id, auth.user_id).await?;
     if deleted {
         Ok(Json(json!({ "success": true })))
     } else {
@@ -162,7 +162,7 @@ pub async fn toggle_credential(
     Json(body): Json<ToggleRequest>,
 ) -> Result<Json<Value>, AppError> {
     let toggled =
-        db::credentials::toggle(&state.db, auth.user_id, credential_id, body.is_active).await?;
+        db::credentials::toggle(&state.db, credential_id, auth.user_id, body.is_active).await?;
     if toggled {
         Ok(Json(json!({ "success": true })))
     } else {

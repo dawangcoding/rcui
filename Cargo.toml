@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/rcui-server", "crates/rcui-cli"]
+resolver = "2"

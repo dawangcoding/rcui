@@ -165,6 +165,7 @@ impl ProviderAdapter for CodexAdapter {
             normalized.extend(entries);
         }
 
+        tracing::debug!(session_id, total, message_count = normalized.len(), has_more, "CodexAdapter: history fetched");
         Ok(FetchHistoryResult {
             messages: normalized,
             total,

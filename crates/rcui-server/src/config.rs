@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -50,6 +51,16 @@ impl AppConfig {
             .ok()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+
+        info!(
+            server_port,
+            %host,
+            ?database_path,
+            is_platform,
+            has_api_key = api_key.is_some(),
+            ?static_dir,
+            "Configuration loaded"
+        );
 
         Self {
             server_port,

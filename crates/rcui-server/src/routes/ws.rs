@@ -5,9 +5,10 @@ use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 use crate::auth;
-use crate::services::chat::{ChatCommand, ChatResponse, execute_command};
+use crate::services::chat::{execute_command, ChatCommand, ChatResponse};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -27,6 +28,12 @@ pub async fn ws_handler(
         .map(|data| data.claims.user_id)
         .ok();
 
+    if user_id.is_some() {
+        debug!(user_id = ?user_id, "WebSocket connection authenticated");
+    } else {
+        warn!("WebSocket connection attempt without valid token");
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state, user_id))
 }
 
@@ -40,6 +47,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: Option<
 
     // Check authentication
     if user_id.is_none() {
+        warn!("WebSocket connection rejected: authentication required");
         let err = ChatResponse::error("Authentication required", None, "system");
         if let Ok(json) = serde_json::to_string(&err) {
             let _ = ws_tx.send(Message::Text(json.into())).await;
@@ -47,6 +55,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: Option<
         let _ = ws_tx.close().await;
         return;
     }
+
+    info!(user_id = ?user_id, "WebSocket connection established");
 
     // Spawn a task to forward chat responses to the WebSocket
     let forward_task = tokio::spawn(async move {
@@ -64,7 +74,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: Option<
     while let Some(msg_result) = ws_rx.next().await {
         let msg = match msg_result {
             Ok(m) => m,
-            Err(_) => break,
+            Err(e) => {
+                debug!(error = %e, "WebSocket receive error");
+                break;
+            }
         };
 
         match msg {
@@ -72,6 +85,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: Option<
                 let text_str: &str = &text;
                 match serde_json::from_str::<ChatCommand>(text_str) {
                     Ok(cmd) => {
+                        debug!(command = ?std::mem::discriminant(&cmd), "WebSocket command received");
                         let tx = chat_tx.clone();
                         let st = state.clone();
                         // Spawn command execution in a separate task
@@ -80,6 +94,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: Option<
                         });
                     }
                     Err(e) => {
+                        warn!(error = %e, "Invalid WebSocket command");
                         let err_msg = ChatResponse::error(
                             &format!("Invalid command: {e}"),
                             None,
@@ -89,10 +104,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: Option<
                     }
                 }
             }
-            Message::Close(_) => break,
+            Message::Close(_) => {
+                debug!("WebSocket close frame received");
+                break;
+            }
             _ => {} // Ignore ping/pong/binary
         }
     }
+
+    info!(user_id = ?user_id, "WebSocket connection closed");
 
     // Clean up
     drop(chat_tx); // Signal the forward task to stop

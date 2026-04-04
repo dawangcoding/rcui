@@ -10,8 +10,8 @@ mod state;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::routing::{any, delete, get, patch, post, put};
 use axum::Router;
-use axum::routing::{delete, get, patch, post, put};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -42,8 +42,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Get or create JWT secret
     let jwt_secret = match std::env::var("JWT_SECRET").ok().filter(|s| !s.is_empty()) {
-        Some(secret) => secret,
-        None => db::app_config::get_or_create_jwt_secret(&pool).await?,
+        Some(secret) => {
+            tracing::debug!("JWT secret loaded from environment variable");
+            secret
+        }
+        None => {
+            tracing::debug!("JWT secret generated and stored in database");
+            db::app_config::get_or_create_jwt_secret(&pool).await?
+        }
     };
 
     // Build application state
@@ -77,35 +83,100 @@ async fn main() -> anyhow::Result<()> {
         // Project routes
         .route("/api/projects", get(routes::projects::list_projects))
         .route("/api/projects/add", post(routes::projects::add_project))
-        .route("/api/projects/{projectName}/rename", put(routes::projects::rename_project))
-        .route("/api/projects/{projectName}", delete(routes::projects::delete_project))
+        .route(
+            "/api/projects/{projectName}/rename",
+            put(routes::projects::rename_project),
+        )
+        .route(
+            "/api/projects/{projectName}",
+            delete(routes::projects::delete_project),
+        )
         // Session routes
-        .route("/api/projects/{projectName}/sessions", get(routes::sessions::list_sessions))
-        .route("/api/sessions/{sessionId}/messages", get(routes::sessions::get_session_messages))
-        .route("/api/sessions/{sessionId}", delete(routes::sessions::delete_session))
-        .route("/api/sessions/{sessionId}/name", post(routes::sessions::set_session_name).delete(routes::sessions::delete_session_name))
+        .route(
+            "/api/projects/{projectName}/sessions",
+            get(routes::sessions::list_sessions),
+        )
+        .route(
+            "/api/sessions/{sessionId}/messages",
+            get(routes::sessions::get_session_messages),
+        )
+        .route(
+            "/api/sessions/{sessionId}",
+            delete(routes::sessions::delete_session),
+        )
+        .route(
+            "/api/sessions/{sessionId}/name",
+            post(routes::sessions::set_session_name)
+                .delete(routes::sessions::delete_session_name),
+        )
         // Settings routes
-        .route("/api/settings/api-keys", get(routes::settings::list_api_keys).post(routes::settings::create_api_key))
-        .route("/api/settings/api-keys/{keyId}", delete(routes::settings::delete_api_key))
-        .route("/api/settings/api-keys/{keyId}/toggle", patch(routes::settings::toggle_api_key))
-        .route("/api/settings/credentials", get(routes::settings::list_credentials).post(routes::settings::create_credential))
-        .route("/api/settings/credentials/{credentialId}", delete(routes::settings::delete_credential))
-        .route("/api/settings/credentials/{credentialId}/toggle", patch(routes::settings::toggle_credential))
-        .route("/api/settings/notification-preferences", get(routes::settings::get_notification_preferences).put(routes::settings::update_notification_preferences))
-        .route("/api/settings/push/vapid-public-key", get(routes::settings::get_vapid_public_key))
-        .route("/api/settings/push/subscribe", post(routes::settings::push_subscribe))
-        .route("/api/settings/push/unsubscribe", post(routes::settings::push_unsubscribe))
+        .route(
+            "/api/settings/api-keys",
+            get(routes::settings::list_api_keys).post(routes::settings::create_api_key),
+        )
+        .route(
+            "/api/settings/api-keys/{keyId}",
+            delete(routes::settings::delete_api_key),
+        )
+        .route(
+            "/api/settings/api-keys/{keyId}/toggle",
+            patch(routes::settings::toggle_api_key),
+        )
+        .route(
+            "/api/settings/credentials",
+            get(routes::settings::list_credentials).post(routes::settings::create_credential),
+        )
+        .route(
+            "/api/settings/credentials/{credentialId}",
+            delete(routes::settings::delete_credential),
+        )
+        .route(
+            "/api/settings/credentials/{credentialId}/toggle",
+            patch(routes::settings::toggle_credential),
+        )
+        .route(
+            "/api/settings/notification-preferences",
+            get(routes::settings::get_notification_preferences)
+                .put(routes::settings::update_notification_preferences),
+        )
+        .route(
+            "/api/settings/push/vapid-public-key",
+            get(routes::settings::get_vapid_public_key),
+        )
+        .route(
+            "/api/settings/push/subscribe",
+            post(routes::settings::push_subscribe),
+        )
+        .route(
+            "/api/settings/push/unsubscribe",
+            post(routes::settings::push_unsubscribe),
+        )
         // User routes
-        .route("/api/user/git-config", get(routes::user::get_git_config).post(routes::user::update_git_config))
-        .route("/api/user/complete-onboarding", post(routes::user::complete_onboarding))
-        .route("/api/user/onboarding-status", get(routes::user::get_onboarding_status))
+        .route(
+            "/api/user/git-config",
+            get(routes::user::get_git_config).post(routes::user::update_git_config),
+        )
+        .route(
+            "/api/user/complete-onboarding",
+            post(routes::user::complete_onboarding),
+        )
+        .route(
+            "/api/user/onboarding-status",
+            get(routes::user::get_onboarding_status),
+        )
         // Git routes
         .route("/api/git/status", get(routes::git::status))
         .route("/api/git/diff", get(routes::git::diff))
         .route("/api/git/file-with-diff", get(routes::git::file_with_diff))
-        .route("/api/git/initial-commit", post(routes::git::initial_commit))
+        .route(
+            "/api/git/initial-commit",
+            post(routes::git::initial_commit),
+        )
         .route("/api/git/commit", post(routes::git::commit))
-        .route("/api/git/revert-local-commit", post(routes::git::revert_local_commit))
+        .route(
+            "/api/git/revert-local-commit",
+            post(routes::git::revert_local_commit),
+        )
         .route("/api/git/branches", get(routes::git::branches))
         .route("/api/git/checkout", post(routes::git::checkout))
         .route("/api/git/create-branch", post(routes::git::create_branch))
@@ -118,25 +189,67 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/git/push", post(routes::git::push))
         .route("/api/git/publish", post(routes::git::publish))
         .route("/api/git/discard", post(routes::git::discard))
-        .route("/api/git/delete-untracked", post(routes::git::delete_untracked))
+        .route(
+            "/api/git/delete-untracked",
+            post(routes::git::delete_untracked),
+        )
         // MCP routes — Claude CLI
         .route("/api/mcp/cli/list", get(routes::mcp::cli_list))
         .route("/api/mcp/cli/add", post(routes::mcp::cli_add))
         .route("/api/mcp/cli/add-json", post(routes::mcp::cli_add_json))
-        .route("/api/mcp/cli/{name}", get(routes::mcp::cli_get).delete(routes::mcp::cli_remove))
+        .route(
+            "/api/mcp/cli/{name}",
+            get(routes::mcp::cli_get).delete(routes::mcp::cli_remove),
+        )
         // MCP routes — Config direct
         .route("/api/mcp/config/read", get(routes::mcp::config_read))
         // MCP routes — Cursor
         .route("/api/cursor/mcp", get(routes::mcp::cursor_mcp_list))
         .route("/api/cursor/mcp/add", post(routes::mcp::cursor_mcp_add))
-        .route("/api/cursor/mcp/add-json", post(routes::mcp::cursor_mcp_add_json))
-        .route("/api/cursor/mcp/{name}", delete(routes::mcp::cursor_mcp_remove))
+        .route(
+            "/api/cursor/mcp/add-json",
+            post(routes::mcp::cursor_mcp_add_json),
+        )
+        .route(
+            "/api/cursor/mcp/{name}",
+            delete(routes::mcp::cursor_mcp_remove),
+        )
         // MCP routes — Utilities
-        .route("/api/mcp-utils/all-servers", get(routes::mcp::all_servers))
+        .route(
+            "/api/mcp-utils/all-servers",
+            get(routes::mcp::all_servers),
+        )
         // Command routes
-        .route("/api/commands/list", post(routes::commands::list_commands))
-        .route("/api/commands/load", post(routes::commands::load_command))
-        .route("/api/commands/execute", post(routes::commands::execute_command));
+        .route(
+            "/api/commands/list",
+            post(routes::commands::list_commands),
+        )
+        .route(
+            "/api/commands/load",
+            post(routes::commands::load_command),
+        )
+        .route(
+            "/api/commands/execute",
+            post(routes::commands::execute_command),
+        )
+        // Stub routes — endpoints called by frontend but not yet implemented
+        .route("/api/plugins", get(stub_plugins))
+        .route(
+            "/api/cli/{provider}/status",
+            get(stub_cli_provider_status),
+        )
+        .route(
+            "/api/taskmaster/installation-status",
+            get(stub_not_implemented),
+        )
+        .route(
+            "/api/mcp-utils/taskmaster-server",
+            get(stub_not_implemented),
+        )
+        // Catch-all for unregistered /api/* paths — return JSON 404 instead of SPA fallback
+        .route("/api/{*rest}", any(api_fallback));
+
+    tracing::debug!("Router configured with all routes");
 
     // Serve static frontend files (SPA with fallback to index.html)
     let app = if let Some(ref static_dir) = config.static_dir {
@@ -156,9 +269,44 @@ async fn main() -> anyhow::Result<()> {
         // State
         .with_state(state);
 
-    tracing::info!("RCUI server starting on :addr");
+    tracing::info!(%addr, "RCUI server starting");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+// ─── Stub handlers for unimplemented frontend-required endpoints ─────────────
+
+async fn stub_plugins() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "plugins": [] }))
+}
+
+async fn stub_cli_provider_status() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "authenticated": false,
+        "email": null,
+        "error": null,
+        "method": null
+    }))
+}
+
+async fn stub_not_implemented() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "installed": false,
+        "available": false
+    }))
+}
+
+/// Return a JSON 404 for any unregistered /api/* path,
+/// preventing the SPA fallback from serving index.html for API requests.
+async fn api_fallback(uri: axum::http::Uri) -> axum::http::Response<axum::body::Body> {
+    tracing::debug!(%uri, "Unregistered API path requested");
+    axum::http::Response::builder()
+        .status(axum::http::StatusCode::NOT_FOUND)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            r#"{"error":"Not Found","message":"This API endpoint is not implemented"}"#,
+        ))
+        .unwrap()
 }

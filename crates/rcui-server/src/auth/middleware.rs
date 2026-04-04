@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
-use axum::http::HeaderMap;
 use axum::http::request::Parts;
+use axum::http::HeaderMap;
+use tracing::{debug, warn};
 
 use crate::db;
 use crate::error::AppError;
@@ -29,6 +30,7 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
     ) -> Result<Self, Self::Rejection> {
         // Platform mode: bypass JWT, use first database user
         if state.config.is_platform {
+            debug!("Platform mode: bypassing JWT authentication");
             let user = db::users::get_first_user(&state.db)
                 .await
                 .map_err(|e| AppError::Internal(e.into()))?
@@ -42,13 +44,20 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
 
         // Extract token from Authorization header or query parameter
         let token = extract_token(&parts.headers, &parts.uri)
-            .ok_or_else(|| AppError::Unauthorized("Missing authentication token".to_string()))?;
+            .ok_or_else(|| {
+                warn!(uri = %parts.uri, "Missing authentication token");
+                AppError::Unauthorized("Missing authentication token".to_string())
+            })?;
 
         // Verify JWT
         let token_data = jwt::verify_token(&state.jwt_secret, &token)
-            .map_err(|_| AppError::Unauthorized("Invalid or expired token".to_string()))?;
+            .map_err(|_| {
+                warn!("Invalid or expired token");
+                AppError::Unauthorized("Invalid or expired token".to_string())
+            })?;
 
         let claims = token_data.claims;
+        debug!(user_id = claims.user_id, %claims.username, "User authenticated");
 
         // Auto-refresh if past 50% lifetime
         let refreshed_token = if jwt::should_refresh(&claims) {
@@ -79,6 +88,7 @@ impl FromRequestParts<Arc<AppState>> for ApiKeyAuth {
     ) -> Result<Self, Self::Rejection> {
         // Platform mode: use first user
         if state.config.is_platform {
+            debug!("ApiKeyAuth: platform mode, using first user");
             let user = db::users::get_first_user(&state.db)
                 .await
                 .map_err(|e| AppError::Internal(e.into()))?
@@ -95,12 +105,20 @@ impl FromRequestParts<Arc<AppState>> for ApiKeyAuth {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
             .or_else(|| extract_query_param(&parts.uri, "apiKey"))
-            .ok_or_else(|| AppError::Unauthorized("Missing API key".to_string()))?;
+            .ok_or_else(|| {
+                warn!("Missing API key");
+                AppError::Unauthorized("Missing API key".to_string())
+            })?;
 
         let user_id = db::api_keys::validate_key(&state.db, &api_key)
             .await
             .map_err(|e| AppError::Internal(e.into()))?
-            .ok_or_else(|| AppError::Unauthorized("Invalid or inactive API key".to_string()))?;
+            .ok_or_else(|| {
+                warn!("Invalid or inactive API key");
+                AppError::Unauthorized("Invalid or inactive API key".to_string())
+            })?;
+
+        debug!(user_id, "API key authenticated");
 
         Ok(ApiKeyAuth { user_id })
     }
@@ -112,13 +130,18 @@ fn extract_token(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
     if let Some(auth_header) = headers.get("authorization") {
         if let Ok(value) = auth_header.to_str() {
             if let Some(token) = value.strip_prefix("Bearer ") {
+                debug!("Token extracted from Authorization header");
                 return Some(token.to_string());
             }
         }
     }
 
     // Fall back to query parameter (for SSE and WebSocket)
-    extract_query_param(uri, "token")
+    let token = extract_query_param(uri, "token");
+    if token.is_some() {
+        debug!("Token extracted from query parameter");
+    }
+    token
 }
 
 /// Extract a named parameter from the URI query string.

@@ -15,6 +15,7 @@ impl ProviderAdapter for GeminiAdapter {
         session_id: &str,
         _opts: FetchHistoryOptions,
     ) -> Result<FetchHistoryResult, AppError> {
+        tracing::debug!(session_id, "GeminiAdapter: fetching history");
         // Read from Gemini CLI sessions on disk
         let raw_messages = match project_scanner::get_gemini_cli_session_messages(session_id).await
         {
@@ -153,6 +154,7 @@ impl ProviderAdapter for GeminiAdapter {
         }
 
         let total = normalized.len();
+        tracing::debug!(session_id, total, "GeminiAdapter: history fetched");
         Ok(FetchHistoryResult {
             messages: normalized,
             total,

@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 use crate::state::AppState;
 
@@ -200,6 +201,7 @@ pub async fn execute_command(
 ) {
     match cmd {
         ChatCommand::ClaudeCommand { command, options } => {
+            info!(provider = "claude", cwd = ?options.cwd, session_id = ?options.session_id, "Executing command");
             spawn_claude(command, options, tx, state).await;
         }
         ChatCommand::CursorCommand {
@@ -207,6 +209,7 @@ pub async fn execute_command(
             session_id,
             options,
         } => {
+            info!(provider = "cursor", cwd = ?options.cwd, "Executing command");
             let mut opts = options;
             if opts.session_id.is_none() {
                 opts.session_id = session_id;
@@ -214,15 +217,18 @@ pub async fn execute_command(
             spawn_cursor(command, opts, tx).await;
         }
         ChatCommand::CodexCommand { command, options } => {
+            info!(provider = "codex", cwd = ?options.cwd, "Executing command");
             spawn_codex(command, options, tx).await;
         }
         ChatCommand::GeminiCommand { command, options } => {
+            info!(provider = "gemini", cwd = ?options.cwd, "Executing command");
             spawn_gemini(command, options, tx).await;
         }
         ChatCommand::AbortSession {
             session_id,
             provider,
         } => {
+            info!(%session_id, %provider, "Aborting session");
             abort_session(&session_id, &provider, &state).await;
             let _ = tx.send(ChatResponse::complete(&session_id, &provider, 1, true));
         }
@@ -230,7 +236,10 @@ pub async fn execute_command(
             session_id,
             provider,
         } => {
-            let active = state.active_sessions.contains_key(&format!("{provider}:{session_id}"));
+            let active = state
+                .active_sessions
+                .contains_key(&format!("{provider}:{session_id}"));
+            debug!(%session_id, %provider, active, "Session status check");
             let _ = tx.send(ChatResponse {
                 kind: "session_status".to_string(),
                 session_id: Some(session_id),
@@ -245,6 +254,7 @@ pub async fn execute_command(
                 .iter()
                 .map(|e| e.key().clone())
                 .collect();
+            debug!(count = sessions.len(), "Active sessions queried");
             let _ = tx.send(ChatResponse {
                 kind: "active_sessions".to_string(),
                 provider: "system".to_string(),
@@ -315,6 +325,8 @@ async fn spawn_claude(
         _ => {}
     }
 
+    info!(provider, %cwd, args = ?args, "Spawning CLI process");
+
     let result = Command::new("claude")
         .args(&args)
         .current_dir(cwd)
@@ -326,6 +338,7 @@ async fn spawn_claude(
     let mut child = match result {
         Ok(c) => c,
         Err(e) => {
+            error!(provider, error = %e, "Failed to spawn CLI process");
             let _ = tx.send(ChatResponse::error(
                 &format!("Failed to spawn claude: {e}"),
                 None,
@@ -338,6 +351,7 @@ async fn spawn_claude(
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
+            error!(provider, "No stdout from CLI process");
             let _ = tx.send(ChatResponse::error("No stdout from claude", None, provider));
             return;
         }
@@ -375,6 +389,7 @@ async fn spawn_claude(
                             if session_id.is_empty() {
                                 if let Some(sid) = event.get("session_id").and_then(|v| v.as_str()) {
                                     session_id = sid.to_string();
+                                    info!(provider, %session_id, "Session created");
                                     // Re-register with real session ID
                                     if let Some((_, session)) = state.active_sessions.remove(&session_key) {
                                         state.active_sessions.insert(
@@ -395,8 +410,12 @@ async fn spawn_claude(
                             let _ = tx.send(ChatResponse::stream_delta(trimmed, sid, provider));
                         }
                     }
-                    Ok(None) => break, // EOF
+                    Ok(None) => {
+                        debug!(provider, %session_id, "Stream EOF");
+                        break;
+                    }
                     Err(e) => {
+                        error!(provider, %session_id, error = %e, "Stream read error");
                         let _ = tx.send(ChatResponse::error(
                             &format!("Read error: {e}"),
                             Some(&session_id),
@@ -407,7 +426,7 @@ async fn spawn_claude(
                 }
             }
             _ = &mut abort_rx => {
-                // Aborted
+                info!(provider, %session_id, "Session aborted");
                 let _ = tx.send(ChatResponse::complete(&session_id, provider, 1, true));
                 state.active_sessions.remove(&format!("{provider}:{session_id}"));
                 return;
@@ -419,6 +438,7 @@ async fn spawn_claude(
     state
         .active_sessions
         .remove(&format!("{provider}:{session_id}"));
+    info!(provider, %session_id, exit_code = 0, "Process completed");
     let _ = tx.send(ChatResponse::complete(&session_id, provider, 0, false));
 }
 
@@ -461,6 +481,8 @@ fn parse_claude_stream_event(event: &Value, session_id: &str) -> Vec<ChatRespons
                 .unwrap_or("unknown");
             let input = event.get("input").cloned().unwrap_or(Value::Null);
 
+            debug!(provider, %session_id, %tool_name, "Tool use event");
+
             msgs.push(ChatResponse {
                 kind: "tool_use".to_string(),
                 tool_name: Some(tool_name.to_string()),
@@ -492,6 +514,7 @@ fn parse_claude_stream_event(event: &Value, session_id: &str) -> Vec<ChatRespons
                 .and_then(|v| v.as_str())
                 .or(event.get("message").and_then(|v| v.as_str()))
                 .unwrap_or("Unknown error");
+            warn!(provider, %session_id, %error_msg, "Stream error event");
             msgs.push(ChatResponse::error(error_msg, Some(session_id), provider));
         }
         _ => {
@@ -539,6 +562,8 @@ async fn spawn_cursor(
 
     args.push("-f".to_string()); // force mode
 
+    info!(provider, %cwd, args = ?args, "Spawning CLI process");
+
     let result = Command::new("cursor-agent")
         .args(&args)
         .current_dir(cwd)
@@ -550,6 +575,7 @@ async fn spawn_cursor(
     let mut child = match result {
         Ok(c) => c,
         Err(e) => {
+            error!(provider, error = %e, "Failed to spawn CLI process");
             let _ = tx.send(ChatResponse::error(
                 &format!("Failed to spawn cursor-agent: {e}"),
                 None,
@@ -562,6 +588,7 @@ async fn spawn_cursor(
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
+            error!(provider, "No stdout from CLI process");
             let _ = tx.send(ChatResponse::error(
                 "No stdout from cursor-agent",
                 None,
@@ -589,6 +616,7 @@ async fn spawn_cursor(
                     // System init message — capture session ID
                     if let Some(sid) = event.get("sessionId").and_then(|v| v.as_str()) {
                         session_id = sid.to_string();
+                        info!(provider, %session_id, "Session created");
                         let _ = tx.send(ChatResponse::session_created(&session_id, provider));
                     }
                 }
@@ -613,6 +641,7 @@ async fn spawn_cursor(
                         .get("error")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Cursor error");
+                    warn!(provider, %session_id, %msg, "Stream error event");
                     let _ = tx.send(ChatResponse::error(msg, Some(&session_id), provider));
                 }
                 _ => {
@@ -635,6 +664,8 @@ async fn spawn_cursor(
         Ok(status) => status.code().unwrap_or(1),
         Err(_) => 1,
     };
+
+    info!(provider, %session_id, exit_code, "Process completed");
 
     let _ = tx.send(ChatResponse::complete(
         &session_id,
@@ -679,6 +710,8 @@ async fn spawn_codex(
 
     args.push(prompt);
 
+    info!(provider, %cwd, args = ?args, "Spawning CLI process");
+
     let result = Command::new("codex")
         .args(&args)
         .current_dir(cwd)
@@ -690,6 +723,7 @@ async fn spawn_codex(
     let mut child = match result {
         Ok(c) => c,
         Err(e) => {
+            error!(provider, error = %e, "Failed to spawn CLI process");
             let _ = tx.send(ChatResponse::error(
                 &format!("Failed to spawn codex: {e}"),
                 None,
@@ -702,6 +736,7 @@ async fn spawn_codex(
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
+            error!(provider, "No stdout from CLI process");
             let _ = tx.send(ChatResponse::error("No stdout from codex", None, provider));
             return;
         }
@@ -711,6 +746,7 @@ async fn spawn_codex(
         .session_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    info!(provider, %session_id, "Session created");
     let _ = tx.send(ChatResponse::session_created(&session_id, provider));
 
     let reader = BufReader::new(stdout);
@@ -757,6 +793,7 @@ async fn spawn_codex(
                                     .get("arguments")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
+                                debug!(provider, %session_id, %name, "Tool use event");
                                 let _ = tx.send(ChatResponse {
                                     kind: "tool_use".to_string(),
                                     tool_name: Some(name.to_string()),
@@ -785,6 +822,7 @@ async fn spawn_codex(
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Codex error");
+                    warn!(provider, %session_id, %msg, "Stream error event");
                     let _ = tx.send(ChatResponse::error(msg, Some(&session_id), provider));
                 }
                 _ => {
@@ -803,6 +841,8 @@ async fn spawn_codex(
         Ok(status) => status.code().unwrap_or(1),
         Err(_) => 1,
     };
+
+    info!(provider, %session_id, exit_code, "Process completed");
 
     let _ = tx.send(ChatResponse::complete(
         &session_id,
@@ -849,6 +889,8 @@ async fn spawn_gemini(
         }
     }
 
+    info!(provider, %cwd, args = ?args, "Spawning CLI process");
+
     let result = Command::new("gemini")
         .args(&args)
         .current_dir(cwd)
@@ -860,6 +902,7 @@ async fn spawn_gemini(
     let mut child = match result {
         Ok(c) => c,
         Err(e) => {
+            error!(provider, error = %e, "Failed to spawn CLI process");
             let _ = tx.send(ChatResponse::error(
                 &format!("Failed to spawn gemini: {e}"),
                 None,
@@ -872,6 +915,7 @@ async fn spawn_gemini(
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
+            error!(provider, "No stdout from CLI process");
             let _ = tx.send(ChatResponse::error(
                 "No stdout from gemini",
                 None,
@@ -885,6 +929,7 @@ async fn spawn_gemini(
         .session_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    info!(provider, %session_id, "Session created");
     let _ = tx.send(ChatResponse::session_created(&session_id, provider));
 
     let reader = BufReader::new(stdout);
@@ -925,6 +970,7 @@ async fn spawn_gemini(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown");
                             let input = event.get("input").cloned().unwrap_or(Value::Null);
+                            debug!(provider, %session_id, %name, "Tool use event");
                             let _ = tx.send(ChatResponse {
                                 kind: "tool_use".to_string(),
                                 tool_name: Some(name.to_string()),
@@ -958,6 +1004,7 @@ async fn spawn_gemini(
                                 .get("error")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Gemini error");
+                            warn!(provider, %session_id, %msg, "Stream error event");
                             let _ =
                                 tx.send(ChatResponse::error(msg, Some(&session_id), provider));
                         }
@@ -975,8 +1022,12 @@ async fn spawn_gemini(
                     let _ = tx.send(ChatResponse::stream_delta(trimmed, &session_id, provider));
                 }
             }
-            Ok(Ok(None)) => break, // EOF
+            Ok(Ok(None)) => {
+                debug!(provider, %session_id, "Stream EOF");
+                break;
+            }
             Ok(Err(e)) => {
+                error!(provider, %session_id, error = %e, "Stream read error");
                 let _ = tx.send(ChatResponse::error(
                     &format!("Read error: {e}"),
                     Some(&session_id),
@@ -986,6 +1037,7 @@ async fn spawn_gemini(
             }
             Err(_) => {
                 // Timeout
+                warn!(provider, %session_id, "Session timed out (120s inactivity)");
                 let _ = tx.send(ChatResponse::error(
                     "Gemini session timed out (120s inactivity)",
                     Some(&session_id),
@@ -1002,6 +1054,8 @@ async fn spawn_gemini(
         Err(_) => 1,
     };
 
+    info!(provider, %session_id, exit_code, "Process completed");
+
     let _ = tx.send(ChatResponse::complete(
         &session_id,
         provider,
@@ -1015,7 +1069,10 @@ async fn spawn_gemini(
 async fn abort_session(session_id: &str, provider: &str, state: &AppState) {
     let key = format!("{provider}:{session_id}");
     if let Some((_, session)) = state.active_sessions.remove(&key) {
+        info!(%session_id, %provider, "Killing session process");
         let mut guard = session.lock().await;
         let _ = guard.child.kill().await;
+    } else {
+        debug!(%session_id, %provider, "Session not found for abort");
     }
 }

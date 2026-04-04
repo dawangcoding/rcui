@@ -78,9 +78,11 @@ async fn run_watcher(state: Arc<AppState>) -> anyhow::Result<()> {
 
         // Clear cache and rescan
         rescan_in_progress = true;
+        tracing::debug!("Clearing project cache and starting rescan");
         project_scanner::clear_project_directory_cache();
 
         let projects = project_scanner::get_projects(&state.db, None).await;
+        let project_count = projects.len();
         let projects_json: Vec<serde_json::Value> = projects
             .iter()
             .map(|p| serde_json::to_value(p).unwrap_or_default())
@@ -91,6 +93,7 @@ async fn run_watcher(state: Arc<AppState>) -> anyhow::Result<()> {
             let mut cache = state.project_cache.write().await;
             *cache = Some(projects_json);
         }
+        tracing::debug!(project_count, "Rescan complete, cache updated");
 
         // Broadcast to connected clients
         let _ = state.broadcast_tx.send(BroadcastMessage::ProjectsUpdated {

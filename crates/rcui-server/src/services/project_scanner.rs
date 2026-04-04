@@ -86,7 +86,9 @@ use std::sync::LazyLock;
 static PROJECT_DIR_CACHE: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
 pub fn clear_project_directory_cache() {
+    let prev_size = PROJECT_DIR_CACHE.len();
     PROJECT_DIR_CACHE.clear();
+    tracing::debug!(prev_size, "Project directory cache cleared");
 }
 
 // ─── Config Management ──────────────────────────────────────────────────────
@@ -121,8 +123,10 @@ pub async fn save_project_config(config: &ProjectConfig) -> std::io::Result<()> 
 pub async fn extract_project_directory(project_name: &str) -> String {
     // Check cache
     if let Some(cached) = PROJECT_DIR_CACHE.get(project_name) {
+        tracing::debug!(project_name, "Project directory cache hit");
         return cached.clone();
     }
+    tracing::debug!(project_name, "Project directory cache miss, resolving");
 
     // Check config for originalPath
     let config = load_project_config().await;
@@ -246,6 +250,7 @@ pub async fn get_claude_sessions(
     limit: Option<usize>,
     offset: usize,
 ) -> (Vec<SessionInfo>, usize, bool) {
+    tracing::debug!(project_name, "Discovering Claude sessions");
     let home = dirs::home_dir().unwrap_or_default();
     let project_dir = home.join(".claude").join("projects").join(project_name);
 
@@ -410,6 +415,7 @@ pub async fn get_cursor_sessions(project_path: &str) -> Vec<SessionInfo> {
 
 /// Build an index of all Codex sessions by project path.
 pub async fn build_codex_sessions_index() -> HashMap<String, Vec<(String, PathBuf)>> {
+    tracing::debug!("Building Codex sessions index");
     let home = dirs::home_dir().unwrap_or_default();
     let sessions_dir = home.join(".codex").join("sessions");
 
@@ -450,10 +456,9 @@ pub async fn build_codex_sessions_index() -> HashMap<String, Vec<(String, PathBu
         }
     }
 
+    tracing::debug!(project_count = index.len(), "Codex sessions index built");
     index
 }
-
-/// Get Codex sessions for a project path.
 pub async fn get_codex_sessions(
     project_path: &str,
     index: &HashMap<String, Vec<(String, PathBuf)>>,
@@ -584,6 +589,7 @@ pub async fn get_projects(
     _pool: &sqlx::SqlitePool,
     progress_tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
 ) -> Vec<Project> {
+    tracing::debug!("Starting project discovery scan");
     let home = dirs::home_dir().unwrap_or_default();
     let claude_projects_dir = home.join(".claude").join("projects");
     let config = load_project_config().await;
@@ -720,6 +726,7 @@ pub async fn get_projects(
         b_latest.cmp(&a_latest)
     });
 
+    tracing::debug!(project_count = projects.len(), "Project discovery scan complete");
     projects
 }
 

@@ -387,6 +387,7 @@ impl ProviderAdapter for CursorAdapter {
 
         let all_normalized = normalize_cursor_blobs(&blobs, session_id);
         let total = all_normalized.len();
+        tracing::debug!(session_id, blob_count = blobs.len(), total, "CursorAdapter: history normalized");
 
         if let Some(limit) = opts.limit {
             let start = opts.offset as usize;

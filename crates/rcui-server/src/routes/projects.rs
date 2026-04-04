@@ -4,6 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing::{debug, info};
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
@@ -27,9 +28,12 @@ pub async fn list_projects(
     if !refresh {
         let cache = state.project_cache.read().await;
         if let Some(ref cached) = *cache {
-            return Ok(Json(json!({ "projects": cached })));
+            debug!(count = cached.len(), "Projects cache hit");
+            return Ok(Json(Value::Array(cached.clone())));
         }
     }
+
+    debug!(refresh, "Scanning projects");
 
     // Discover projects
     let projects = project_scanner::get_projects(&state.db, None).await;
@@ -38,13 +42,15 @@ pub async fn list_projects(
         .map(|p| serde_json::to_value(p).unwrap_or_default())
         .collect();
 
+    debug!(count = projects_json.len(), "Projects discovered");
+
     // Update cache
     {
         let mut cache = state.project_cache.write().await;
         *cache = Some(projects_json.clone());
     }
 
-    Ok(Json(json!({ "projects": projects_json })))
+    Ok(Json(Value::Array(projects_json)))
 }
 
 /// POST /api/projects/add — Add a project manually.
@@ -59,6 +65,8 @@ pub async fn add_project(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AddProjectRequest>,
 ) -> Result<Json<Value>, AppError> {
+    info!(path = %body.project_path, "Adding project manually");
+
     let project_name = project_scanner::add_project_manually(&body.project_path).await?;
 
     // Invalidate cache
@@ -66,6 +74,8 @@ pub async fn add_project(
         let mut cache = state.project_cache.write().await;
         *cache = None;
     }
+
+    info!(%project_name, "Project added");
 
     Ok(Json(json!({
         "success": true,
@@ -86,6 +96,8 @@ pub async fn rename_project(
     Path(project_name): Path<String>,
     Json(body): Json<RenameProjectRequest>,
 ) -> Result<Json<Value>, AppError> {
+    info!(%project_name, display_name = %body.display_name, "Renaming project");
+
     project_scanner::rename_project(&project_name, &body.display_name).await?;
 
     // Invalidate cache
@@ -103,6 +115,8 @@ pub async fn delete_project(
     State(state): State<Arc<AppState>>,
     Path(project_name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
+    info!(%project_name, "Deleting project");
+
     project_scanner::delete_project(&project_name).await?;
 
     // Invalidate cache

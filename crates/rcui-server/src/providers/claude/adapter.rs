@@ -90,6 +90,7 @@ impl ProviderAdapter for ClaudeAdapter {
             false
         };
 
+        tracing::debug!(session_id, total, message_count = normalized.len(), has_more, "ClaudeAdapter: history fetched");
         Ok(FetchHistoryResult {
             messages: normalized,
             total,

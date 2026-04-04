@@ -4,16 +4,17 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing::{debug, info};
 
 use crate::auth::middleware::AuthUser;
 use crate::db;
 use crate::error::AppError;
-use crate::providers::ProviderAdapter;
 use crate::providers::claude::adapter::ClaudeAdapter;
 use crate::providers::codex::adapter::CodexAdapter;
 use crate::providers::cursor::adapter::CursorAdapter;
 use crate::providers::gemini::adapter::GeminiAdapter;
 use crate::providers::types::{FetchHistoryOptions, SessionProvider};
+use crate::providers::ProviderAdapter;
 use crate::services::project_scanner;
 use crate::state::AppState;
 
@@ -35,8 +36,12 @@ pub async fn list_sessions(
     let limit = query.limit.map(|l| l as usize);
     let offset = query.offset.unwrap_or(0) as usize;
 
+    debug!(%project_name, ?limit, offset, "Listing sessions");
+
     let (sessions, total, has_more) =
         project_scanner::get_claude_sessions(&project_name, limit, offset).await;
+
+    debug!(%project_name, total, has_more, "Sessions listed");
 
     Ok(Json(json!({
         "sessions": sessions,
@@ -67,6 +72,8 @@ pub async fn get_session_messages(
         .parse()
         .map_err(|e: String| AppError::BadRequest(e))?;
 
+    debug!(%session_id, %provider_str, "Fetching session messages");
+
     let opts = FetchHistoryOptions {
         project_name: query.project_name.clone(),
         project_path: query.project_path.clone(),
@@ -80,6 +87,14 @@ pub async fn get_session_messages(
         SessionProvider::Codex => CodexAdapter.fetch_history(&session_id, opts).await?,
         SessionProvider::Gemini => GeminiAdapter.fetch_history(&session_id, opts).await?,
     };
+
+    debug!(
+        %session_id,
+        %provider_str,
+        total = result.total,
+        returned = result.messages.len(),
+        "Session messages fetched"
+    );
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
@@ -101,6 +116,8 @@ pub async fn delete_session(
     let provider = query.provider.as_deref().unwrap_or("claude");
     let project_name = query.project_name.as_deref().unwrap_or("");
 
+    info!(%session_id, %provider, "Deleting session");
+
     project_scanner::delete_session(project_name, &session_id, provider).await?;
 
     Ok(Json(json!({ "success": true })))
@@ -121,6 +138,7 @@ pub async fn set_session_name(
     Json(body): Json<SetNameRequest>,
 ) -> Result<Json<Value>, AppError> {
     let provider = body.provider.as_deref().unwrap_or("claude");
+    debug!(%session_id, %provider, name = %body.name, "Setting session name");
     db::session_names::set_name(&state.db, &session_id, provider, &body.name).await?;
     Ok(Json(json!({ "success": true })))
 }
@@ -139,6 +157,7 @@ pub async fn delete_session_name(
     Query(query): Query<DeleteNameQuery>,
 ) -> Result<Json<Value>, AppError> {
     let provider = query.provider.as_deref().unwrap_or("claude");
+    debug!(%session_id, %provider, "Deleting session name");
     db::session_names::delete_name(&state.db, &session_id, provider).await?;
     Ok(Json(json!({ "success": true })))
 }

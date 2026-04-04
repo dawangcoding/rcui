@@ -62,32 +62,37 @@ impl ProviderAdapter for ClaudeAdapter {
             }
         }
 
-        let total = raw_messages.len();
-
-        // Apply pagination
-        let paginated = if let Some(limit) = opts.limit {
-            let start = opts.offset as usize;
-            let end = (start + limit as usize).min(total);
-            if start < total {
-                &raw_messages[start..end]
-            } else {
-                &[]
-            }
-        } else {
-            &raw_messages[..]
-        };
-
-        // Normalize all messages
-        let mut normalized = Vec::new();
-        for raw in paginated {
+        // Normalize ALL messages first, then paginate the normalized result.
+        // Raw JSONL entries include non-message items (queue-operation, last-prompt,
+        // redacted_thinking) that produce no output. Paginating raw entries causes
+        // pages with far fewer visible messages than requested and inconsistent
+        // offset tracking between frontend and backend.
+        let mut all_normalized = Vec::new();
+        for raw in &raw_messages {
             let entries = self.normalize_message(raw, session_id);
-            normalized.extend(entries);
+            all_normalized.extend(entries);
         }
 
-        let has_more = if let Some(limit) = opts.limit {
-            (opts.offset as usize + limit as usize) < total
+        let total = all_normalized.len();
+
+        // Paginate from the END so the initial load (offset=0) returns the most
+        // recent messages — the natural expectation for a chat UI.
+        // offset=0  → newest messages
+        // offset=20 → next 20 older messages, etc.
+        let (normalized, has_more) = if let Some(limit) = opts.limit {
+            let limit = limit as usize;
+            let offset = opts.offset as usize;
+            if offset >= total {
+                (vec![], false)
+            } else {
+                let available = total - offset;
+                let take = available.min(limit);
+                let start = total - offset - take;
+                let end = total - offset;
+                (all_normalized[start..end].to_vec(), (offset + take) < total)
+            }
         } else {
-            false
+            (all_normalized, false)
         };
 
         tracing::debug!(session_id, total, message_count = normalized.len(), has_more, "ClaudeAdapter: history fetched");

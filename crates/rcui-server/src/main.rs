@@ -10,6 +10,7 @@ mod state;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, delete, get, patch, post, put};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
@@ -95,9 +96,22 @@ async fn main() -> anyhow::Result<()> {
             "/api/projects/{projectName}",
             delete(routes::projects::delete_project),
         )
+        // upload-images: merge a sub-router with a larger body limit (30MB)
+        .merge(
+            Router::new()
+                .route(
+                    "/api/projects/{projectName}/upload-images",
+                    post(routes::projects::upload_images),
+                )
+                .layer(DefaultBodyLimit::max(30 * 1024 * 1024)),
+        )
         .route(
-            "/api/projects/{projectName}/upload-images",
-            post(routes::projects::upload_images),
+            "/api/projects/{projectName}/file",
+            get(routes::projects::read_file),
+        )
+        .route(
+            "/api/projects/{projectName}/files/content",
+            get(routes::projects::read_file_content),
         )
         // Session routes
         .route(

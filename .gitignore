@@ -6,3 +6,5 @@
 .env
 frontend/node_modules
 frontend/dist
+.tmp/
+.DS_Store

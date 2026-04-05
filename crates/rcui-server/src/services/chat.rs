@@ -229,12 +229,10 @@ struct ImageProcessingResult {
 
 /// Save base64 data-URI images to temporary files and append their paths to the prompt.
 /// Returns the modified prompt and the temp directory path for cleanup.
-async fn handle_images(command: &str, images: &[Value]) -> ImageProcessingResult {
+async fn handle_images(command: &str, images: &[Value], cwd: &str) -> ImageProcessingResult {
     let mut temp_image_paths = Vec::new();
-    let temp_dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".rcui")
-        .join("tmp")
+    let temp_dir = std::path::PathBuf::from(cwd)
+        .join(".tmp")
         .join("images")
         .join(format!(
             "{}",
@@ -492,7 +490,7 @@ async fn spawn_claude(
     // Handle images: save to temp files and modify prompt with file paths
     let image_result = if let Some(ref images) = opts.images {
         if !images.is_empty() {
-            Some(handle_images(&prompt, images).await)
+            Some(handle_images(&prompt, images, cwd).await)
         } else {
             None
         }

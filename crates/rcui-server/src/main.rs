@@ -101,6 +101,10 @@ async fn main() -> anyhow::Result<()> {
             delete(routes::sessions::delete_project_session),
         )
         .route(
+            "/api/projects/{projectName}/sessions/{sessionId}/token-usage",
+            get(routes::sessions::get_session_token_usage),
+        )
+        .route(
             "/api/sessions/{sessionId}/messages",
             get(routes::sessions::get_session_messages),
         )

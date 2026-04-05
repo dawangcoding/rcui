@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::AsyncBufReadExt;
 
 use crate::error::AppError;
@@ -8,6 +8,54 @@ use crate::providers::types::*;
 use crate::providers::utils::is_internal_content;
 
 pub struct ClaudeAdapter;
+
+/// Extract token usage from raw JSONL messages.
+/// Scans from the end to find the latest assistant message with usage data.
+/// Returns `{ used, total, breakdown }` matching the original Node.js format.
+pub fn extract_token_usage(raw_messages: &[Value]) -> Option<Value> {
+    let context_window: u64 = std::env::var("CONTEXT_WINDOW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(160000);
+
+    for raw in raw_messages.iter().rev() {
+        let msg_type = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if msg_type != "assistant" {
+            continue;
+        }
+        let usage = match raw.get("message").and_then(|m| m.get("usage")) {
+            Some(u) => u,
+            None => continue,
+        };
+
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_creation = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let total_used = input_tokens + cache_creation + cache_read;
+
+        return Some(json!({
+            "used": total_used,
+            "total": context_window,
+            "breakdown": {
+                "input": input_tokens,
+                "cacheCreation": cache_creation,
+                "cacheRead": cache_read
+            }
+        }));
+    }
+
+    None
+}
 
 #[async_trait]
 impl ProviderAdapter for ClaudeAdapter {
@@ -62,6 +110,11 @@ impl ProviderAdapter for ClaudeAdapter {
             }
         }
 
+        // Extract token usage from the latest assistant message (scan from end).
+        // Claude's usage.input_tokens represents the full conversation context for
+        // that turn, so the last assistant message gives us current context usage.
+        let token_usage = extract_token_usage(&raw_messages);
+
         // Normalize ALL messages first, then paginate the normalized result.
         // Raw JSONL entries include non-message items (queue-operation, last-prompt,
         // redacted_thinking) that produce no output. Paginating raw entries causes
@@ -102,7 +155,7 @@ impl ProviderAdapter for ClaudeAdapter {
             has_more,
             offset: opts.offset,
             limit: opts.limit,
-            token_usage: None,
+            token_usage,
         })
     }
 

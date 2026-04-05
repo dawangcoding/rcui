@@ -25,6 +25,8 @@ pub enum BroadcastMessage {
 pub struct ActiveSession {
     pub child: tokio::process::Child,
     pub abort_tx: tokio::sync::oneshot::Sender<()>,
+    /// Channel for writing to the CLI process's stdin (e.g. permission responses).
+    pub stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// PTY session info for shell WebSocket reuse.

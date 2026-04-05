@@ -104,6 +104,8 @@ pub struct ChatResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -184,6 +186,7 @@ impl ChatResponse {
             tool_name: None,
             tool_input: None,
             tool_result: None,
+            tool_id: None,
             request_id: None,
             role: None,
             extra: None,
@@ -291,8 +294,51 @@ pub async fn execute_command(
                 ..ChatResponse::empty()
             });
         }
-        ChatCommand::ClaudePermissionResponse { .. } => {
-            // Permission responses need to be forwarded to the Claude process stdin
+        ChatCommand::ClaudePermissionResponse {
+            request_id,
+            allow,
+            updated_input,
+            message,
+        } => {
+            info!(%request_id, %allow, "Forwarding permission response to Claude CLI");
+            // Find the active Claude session and forward the response via stdin
+            let mut target_key = None;
+            for entry in state.active_sessions.iter() {
+                if entry.key().starts_with("claude:") {
+                    target_key = Some(entry.key().clone());
+                    break;
+                }
+            }
+            if let Some(key) = target_key {
+                if let Some(entry) = state.active_sessions.get(&key) {
+                    let session = entry.lock().await;
+                    if let Some(ref stdin_tx) = session.stdin_tx {
+                        // Build the permission response JSON for Claude CLI stdin.
+                        let mut response = json!({
+                            "type": "permission_response",
+                            "requestId": request_id,
+                            "result": if allow { "allow" } else { "deny" },
+                        });
+                        if let Some(input) = updated_input {
+                            response
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("updatedInput".to_string(), input);
+                        }
+                        if let Some(msg) = message {
+                            response
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("message".to_string(), json!(msg));
+                        }
+                        let _ = stdin_tx.send(response.to_string());
+                    } else {
+                        warn!(%request_id, "No stdin channel for Claude session");
+                    }
+                }
+            } else {
+                warn!(%request_id, "No active Claude session found for permission response");
+            }
         }
     }
 }
@@ -343,12 +389,43 @@ async fn spawn_claude(
         _ => {}
     }
 
+    // Pass allowedTools from frontend settings (localStorage-based tool permissions).
+    // These are saved by the user via the permission UI and sent in toolsSettings.
+    if let Some(ref tools_settings) = opts.tools_settings {
+        if tools_settings
+            .get("skipPermissions")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            && !args.contains(&"--dangerously-skip-permissions".to_string())
+        {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+
+        if let Some(allowed) = tools_settings.get("allowedTools").and_then(|v| v.as_array()) {
+            let tools: Vec<&str> = allowed.iter().filter_map(|v| v.as_str()).collect();
+            if !tools.is_empty() {
+                // Merge with existing --allowedTools if present, or add new
+                if let Some(idx) = args.iter().position(|a| a == "--allowedTools") {
+                    // Append to existing value
+                    if let Some(existing) = args.get_mut(idx + 1) {
+                        existing.push(',');
+                        existing.push_str(&tools.join(","));
+                    }
+                } else {
+                    args.push("--allowedTools".to_string());
+                    args.push(tools.join(","));
+                }
+            }
+        }
+    }
+
     info!(provider, %cwd, args = ?args, "Spawning CLI process");
 
     let result = Command::new("claude")
         .args(&args)
         .current_dir(cwd)
         .env("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -381,6 +458,27 @@ async fn spawn_claude(
         drain_stderr(stderr, "claude");
     }
 
+    // Set up stdin channel for writing permission responses
+    let stdin_tx = if let Some(child_stdin) = child.stdin.take() {
+        let (tx_stdin, mut rx_stdin) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child_stdin;
+            while let Some(line) = rx_stdin.recv().await {
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                if stdin.write_all(b"\n").await.is_err() {
+                    break;
+                }
+                let _ = stdin.flush().await;
+            }
+        });
+        Some(tx_stdin)
+    } else {
+        None
+    };
+
     // Register active session
     let session_key = format!("{provider}:pending");
     let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel();
@@ -389,6 +487,7 @@ async fn spawn_claude(
         Arc::new(tokio::sync::Mutex::new(crate::state::ActiveSession {
             child,
             abort_tx,
+            stdin_tx,
         })),
     );
 
@@ -396,6 +495,7 @@ async fn spawn_claude(
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     let mut last_activity = tokio::time::Instant::now();
+    let mut tracker = ClaudeStreamTracker::new();
 
     loop {
         tokio::select! {
@@ -409,7 +509,7 @@ async fn spawn_claude(
                         }
 
                         if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
-                            let parsed = parse_claude_stream_event(&event, &session_id);
+                            let parsed = parse_claude_stream_event(&event, &session_id, &mut tracker);
 
                             // Capture session ID from first event
                             if session_id.is_empty() {
@@ -480,8 +580,40 @@ async fn spawn_claude(
     let _ = tx.send(ChatResponse::complete(&session_id, provider, 0, false));
 }
 
+/// State tracker for Claude stream-json content blocks.
+/// Accumulates thinking text and tool input across multiple delta events,
+/// emitting complete messages on content_block_stop.
+struct ClaudeStreamTracker {
+    /// The type of the current content block being streamed.
+    current_block_type: Option<String>,
+    /// Accumulated thinking text for the current thinking block.
+    thinking_buffer: String,
+    /// Accumulated partial JSON for the current tool_use input.
+    tool_input_buffer: String,
+    /// Tool name from the current tool_use content_block_start.
+    current_tool_name: Option<String>,
+    /// Tool ID from the current tool_use content_block_start.
+    current_tool_id: Option<String>,
+}
+
+impl ClaudeStreamTracker {
+    fn new() -> Self {
+        Self {
+            current_block_type: None,
+            thinking_buffer: String::new(),
+            tool_input_buffer: String::new(),
+            current_tool_name: None,
+            current_tool_id: None,
+        }
+    }
+}
+
 /// Parse a Claude stream-json event into ChatResponse messages.
-fn parse_claude_stream_event(event: &Value, session_id: &str) -> Vec<ChatResponse> {
+fn parse_claude_stream_event(
+    event: &Value,
+    session_id: &str,
+    tracker: &mut ClaudeStreamTracker,
+) -> Vec<ChatResponse> {
     let provider = "claude";
     let mut msgs = Vec::new();
 
@@ -489,35 +621,191 @@ fn parse_claude_stream_event(event: &Value, session_id: &str) -> Vec<ChatRespons
 
     match kind {
         "assistant" => {
-            // Text content from assistant
+            // Initial message event — content is typically empty in stream mode.
+            // If content is populated (non-streaming or final), extract all parts.
             if let Some(content) = event.get("message").and_then(|m| m.get("content")) {
                 if let Some(text) = content.as_str() {
                     msgs.push(ChatResponse::stream_delta(text, session_id, provider));
                 } else if let Some(arr) = content.as_array() {
                     for part in arr {
-                        if part.get("type").and_then(|v| v.as_str()) == Some("text") {
-                            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                                msgs.push(ChatResponse::stream_delta(t, session_id, provider));
+                        let part_type =
+                            part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match part_type {
+                            "text" => {
+                                if let Some(t) =
+                                    part.get("text").and_then(|v| v.as_str())
+                                {
+                                    if !t.is_empty() {
+                                        msgs.push(ChatResponse::stream_delta(
+                                            t, session_id, provider,
+                                        ));
+                                    }
+                                }
                             }
+                            "thinking" => {
+                                if let Some(t) =
+                                    part.get("thinking").and_then(|v| v.as_str())
+                                {
+                                    if !t.is_empty() {
+                                        msgs.push(ChatResponse {
+                                            kind: "thinking".to_string(),
+                                            content: Some(t.to_string()),
+                                            session_id: Some(
+                                                session_id.to_string(),
+                                            ),
+                                            provider: provider.to_string(),
+                                            ..ChatResponse::empty()
+                                        });
+                                    }
+                                }
+                            }
+                            "tool_use" => {
+                                let tool_name = part
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let tool_id = part
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let input = part
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                msgs.push(ChatResponse {
+                                    kind: "tool_use".to_string(),
+                                    tool_name: Some(tool_name.to_string()),
+                                    tool_input: Some(input),
+                                    tool_id,
+                                    session_id: Some(
+                                        session_id.to_string(),
+                                    ),
+                                    provider: provider.to_string(),
+                                    ..ChatResponse::empty()
+                                });
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
         }
-        "content_block_delta" => {
-            if let Some(delta) = event.get("delta") {
-                if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                    msgs.push(ChatResponse::stream_delta(text, session_id, provider));
+        "content_block_start" => {
+            if let Some(block) = event.get("content_block") {
+                let block_type =
+                    block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                tracker.current_block_type = Some(block_type.to_string());
+                match block_type {
+                    "thinking" => {
+                        tracker.thinking_buffer.clear();
+                    }
+                    "tool_use" => {
+                        tracker.current_tool_name = block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        tracker.current_tool_id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        tracker.tool_input_buffer.clear();
+                    }
+                    _ => {}
                 }
             }
         }
+        "content_block_delta" => {
+            if let Some(delta) = event.get("delta") {
+                let delta_type =
+                    delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match delta_type {
+                    "thinking_delta" => {
+                        if let Some(thinking) =
+                            delta.get("thinking").and_then(|v| v.as_str())
+                        {
+                            tracker.thinking_buffer.push_str(thinking);
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(partial) =
+                            delta.get("partial_json").and_then(|v| v.as_str())
+                        {
+                            tracker.tool_input_buffer.push_str(partial);
+                        }
+                    }
+                    _ => {
+                        // text_delta or other — extract text
+                        if let Some(text) =
+                            delta.get("text").and_then(|v| v.as_str())
+                        {
+                            msgs.push(ChatResponse::stream_delta(
+                                text, session_id, provider,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        "content_block_stop" => {
+            if let Some(ref block_type) = tracker.current_block_type {
+                match block_type.as_str() {
+                    "thinking" => {
+                        if !tracker.thinking_buffer.is_empty() {
+                            msgs.push(ChatResponse {
+                                kind: "thinking".to_string(),
+                                content: Some(std::mem::take(
+                                    &mut tracker.thinking_buffer,
+                                )),
+                                session_id: Some(session_id.to_string()),
+                                provider: provider.to_string(),
+                                ..ChatResponse::empty()
+                            });
+                        }
+                    }
+                    "tool_use" => {
+                        let input: Value =
+                            if !tracker.tool_input_buffer.is_empty() {
+                                serde_json::from_str(&tracker.tool_input_buffer)
+                                    .unwrap_or(Value::String(std::mem::take(
+                                        &mut tracker.tool_input_buffer,
+                                    )))
+                            } else {
+                                Value::Null
+                            };
+                        tracker.tool_input_buffer.clear();
+                        let tool_name = tracker
+                            .current_tool_name
+                            .take()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let tool_id = tracker.current_tool_id.take();
+                        debug!(provider, %session_id, %tool_name, "Tool use from content block");
+                        msgs.push(ChatResponse {
+                            kind: "tool_use".to_string(),
+                            tool_name: Some(tool_name),
+                            tool_input: Some(input),
+                            tool_id,
+                            session_id: Some(session_id.to_string()),
+                            provider: provider.to_string(),
+                            ..ChatResponse::empty()
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            tracker.current_block_type = None;
+        }
         "tool_use" | "tool_use_begin" => {
+            // CLI-specific tool_use events (non-content-block format)
             let tool_name = event
                 .get("tool")
                 .or(event.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             let input = event.get("input").cloned().unwrap_or(Value::Null);
+            let tool_id = event
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             debug!(provider, %session_id, %tool_name, "Tool use event");
 
@@ -525,6 +813,7 @@ fn parse_claude_stream_event(event: &Value, session_id: &str) -> Vec<ChatRespons
                 kind: "tool_use".to_string(),
                 tool_name: Some(tool_name.to_string()),
                 tool_input: Some(input),
+                tool_id,
                 session_id: Some(session_id.to_string()),
                 provider: provider.to_string(),
                 ..ChatResponse::empty()
@@ -532,9 +821,15 @@ fn parse_claude_stream_event(event: &Value, session_id: &str) -> Vec<ChatRespons
         }
         "tool_result" => {
             let result = event.get("result").or(event.get("output")).cloned();
+            let tool_id = event
+                .get("tool_use_id")
+                .or(event.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             msgs.push(ChatResponse {
                 kind: "tool_result".to_string(),
                 tool_result: result,
+                tool_id,
                 session_id: Some(session_id.to_string()),
                 provider: provider.to_string(),
                 ..ChatResponse::empty()
@@ -544,6 +839,32 @@ fn parse_claude_stream_event(event: &Value, session_id: &str) -> Vec<ChatRespons
             // Final result message
             if let Some(result_text) = event.get("result").and_then(|v| v.as_str()) {
                 msgs.push(ChatResponse::stream_delta(result_text, session_id, provider));
+            }
+        }
+        // Permission request events from Claude CLI stream-json.
+        // Multiple event type names for compatibility across CLI versions.
+        "tool_use_permission" | "permission_request" | "ask_permission" => {
+            let request_id = event
+                .get("requestId")
+                .or(event.get("request_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let tool_name = event
+                .get("toolName")
+                .or(event.get("tool"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let input = event
+                .get("input")
+                .or(event.get("toolInput"))
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            if !request_id.is_empty() {
+                info!(provider, %session_id, %request_id, %tool_name, "Permission request");
+                msgs.push(ChatResponse::permission_request(
+                    request_id, tool_name, input, session_id,
+                ));
             }
         }
         "error" => {
@@ -650,6 +971,7 @@ async fn spawn_cursor(
         Arc::new(tokio::sync::Mutex::new(crate::state::ActiveSession {
             child,
             abort_tx,
+            stdin_tx: None,
         })),
     );
 
@@ -856,6 +1178,7 @@ async fn spawn_codex(
         Arc::new(tokio::sync::Mutex::new(crate::state::ActiveSession {
             child,
             abort_tx,
+            stdin_tx: None,
         })),
     );
 
@@ -1067,6 +1390,7 @@ async fn spawn_gemini(
         Arc::new(tokio::sync::Mutex::new(crate::state::ActiveSession {
             child,
             abort_tx,
+            stdin_tx: None,
         })),
     );
 

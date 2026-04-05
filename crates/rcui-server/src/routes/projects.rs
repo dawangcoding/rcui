@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::Json;
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
@@ -187,4 +188,95 @@ pub async fn delete_project(
     }
 
     Ok(Json(json!({ "success": true })))
+}
+
+/// POST /api/projects/:projectName/upload-images — Upload images for chat attachments.
+///
+/// Accepts multipart form data with field "images" containing image files.
+/// Returns base64-encoded image data for passing to AI providers.
+const MAX_IMAGE_SIZE: usize = 5 * 1024 * 1024; // 5MB
+const MAX_IMAGE_COUNT: usize = 5;
+
+pub async fn upload_images(
+    _auth: AuthUser,
+    Path(_project_name): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let mut images = Vec::new();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart data: {e}")))?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        if field_name != "images" {
+            continue;
+        }
+
+        if images.len() >= MAX_IMAGE_COUNT {
+            warn!("Too many images, max {MAX_IMAGE_COUNT}");
+            break;
+        }
+
+        let file_name = field
+            .file_name()
+            .unwrap_or("image.png")
+            .to_string();
+
+        let content_type = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        // Validate MIME type
+        if !content_type.starts_with("image/") {
+            return Err(AppError::BadRequest(format!(
+                "Invalid file type: {content_type}. Only images are allowed."
+            )));
+        }
+
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Failed to read image data: {e}")))?;
+
+        if data.len() > MAX_IMAGE_SIZE {
+            return Err(AppError::BadRequest(format!(
+                "Image '{}' exceeds maximum size of 5MB",
+                file_name
+            )));
+        }
+
+        // Determine MIME type: prefer content-type header, fallback to extension guess
+        let mime_type = if content_type != "application/octet-stream" {
+            content_type
+        } else {
+            mime_guess::from_path(&file_name)
+                .first_or_octet_stream()
+                .to_string()
+        };
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        let data_uri = format!("data:{mime_type};base64,{encoded}");
+
+        images.push(json!({
+            "name": file_name,
+            "data": data_uri,
+            "size": data.len(),
+            "mimeType": mime_type,
+        }));
+
+        debug!(name = %file_name, size = data.len(), "Image uploaded");
+    }
+
+    if images.is_empty() {
+        return Err(AppError::BadRequest(
+            "No images provided".to_string(),
+        ));
+    }
+
+    info!(count = images.len(), "Images uploaded successfully");
+
+    Ok(Json(json!({ "images": images })))
 }

@@ -95,6 +95,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/projects/{projectName}",
             delete(routes::projects::delete_project),
         )
+        .route(
+            "/api/projects/{projectName}/upload-images",
+            post(routes::projects::upload_images),
+        )
         // Session routes
         .route(
             "/api/projects/{projectName}/sessions",

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -75,6 +76,8 @@ pub struct CommandOptions {
     pub skip_permissions: Option<bool>,
     #[serde(default)]
     pub tools_settings: Option<Value>,
+    #[serde(default)]
+    pub images: Option<Vec<Value>>,
 }
 
 // ─── Outgoing Messages (Server → Client) ──────────────────────────────────────
@@ -213,6 +216,118 @@ fn drain_stderr(stderr: tokio::process::ChildStderr, provider: &'static str) {
 
 /// Inactivity timeout for CLI processes (120 seconds).
 const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+// ─── Image Handling ──────────────────────────────────────────────────────────
+
+/// Result of processing images for CLI consumption.
+struct ImageProcessingResult {
+    /// The prompt with image file paths appended.
+    modified_command: String,
+    /// Temporary directory containing image files (for cleanup).
+    temp_dir: Option<std::path::PathBuf>,
+}
+
+/// Save base64 data-URI images to temporary files and append their paths to the prompt.
+/// Returns the modified prompt and the temp directory path for cleanup.
+async fn handle_images(command: &str, images: &[Value], cwd: &str) -> ImageProcessingResult {
+    let mut temp_image_paths = Vec::new();
+    let temp_dir = std::path::PathBuf::from(cwd)
+        .join(".tmp")
+        .join("images")
+        .join(format!("{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()));
+
+    if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+        warn!(error = %e, "Failed to create temp image directory");
+        return ImageProcessingResult {
+            modified_command: command.to_string(),
+            temp_dir: None,
+        };
+    }
+
+    for (index, image) in images.iter().enumerate() {
+        let data_uri = match image.get("data").and_then(|v| v.as_str()) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        // Parse data URI: data:<mimeType>;base64,<base64data>
+        let base64_data = if let Some(pos) = data_uri.find(";base64,") {
+            &data_uri[pos + 8..]
+        } else {
+            // Not a data URI, try as raw base64
+            data_uri
+        };
+
+        let mime_type = if data_uri.starts_with("data:") {
+            data_uri
+                .strip_prefix("data:")
+                .and_then(|s| s.split(';').next())
+                .unwrap_or("image/png")
+        } else {
+            image
+                .get("mimeType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png")
+        };
+
+        let extension = mime_type.split('/').nth(1).unwrap_or("png");
+        let filename = format!("image_{index}.{extension}");
+        let filepath = temp_dir.join(&filename);
+
+        match base64::engine::general_purpose::STANDARD.decode(base64_data) {
+            Ok(bytes) => {
+                if let Err(e) = tokio::fs::write(&filepath, &bytes).await {
+                    warn!(error = %e, "Failed to write temp image file");
+                    continue;
+                }
+                temp_image_paths.push(filepath);
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to decode base64 image data");
+                continue;
+            }
+        }
+    }
+
+    if temp_image_paths.is_empty() {
+        // No images were processed; clean up the empty directory
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        return ImageProcessingResult {
+            modified_command: command.to_string(),
+            temp_dir: None,
+        };
+    }
+
+    // Append image file paths to the prompt
+    let image_note = format!(
+        "\n\n[Images provided at the following paths:]\n{}",
+        temp_image_paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{}. {}", i + 1, p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    info!(count = temp_image_paths.len(), "Images saved to temp files");
+
+    ImageProcessingResult {
+        modified_command: format!("{command}{image_note}"),
+        temp_dir: Some(temp_dir),
+    }
+}
+
+/// Clean up temporary image files and directory.
+async fn cleanup_temp_images(temp_dir: Option<std::path::PathBuf>) {
+    if let Some(dir) = temp_dir {
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            warn!(error = %e, path = %dir.display(), "Failed to clean up temp image directory");
+        }
+    }
+}
 
 // ─── Provider CLI Execution ──────────────────────────────────────────────────
 
@@ -358,12 +473,28 @@ async fn spawn_claude(
         .or(opts.project_path.as_deref())
         .unwrap_or(".");
 
+    // Handle images: save to temp files and modify prompt with file paths
+    let image_result = if let Some(ref images) = opts.images {
+        if !images.is_empty() {
+            Some(handle_images(&prompt, images, cwd).await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let final_prompt = match image_result {
+        Some(ref r) => r.modified_command.clone(),
+        None => prompt,
+    };
+
     let mut args: Vec<String> = vec![
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
         "-p".to_string(),
-        prompt,
+        final_prompt,
     ];
 
     if let Some(ref sid) = opts.session_id {
@@ -431,6 +562,8 @@ async fn spawn_claude(
         .kill_on_drop(true)
         .spawn();
 
+    let temp_dir = image_result.and_then(|r| r.temp_dir);
+
     let mut child = match result {
         Ok(c) => c,
         Err(e) => {
@@ -440,6 +573,7 @@ async fn spawn_claude(
                 None,
                 provider,
             ));
+            cleanup_temp_images(temp_dir).await;
             return;
         }
     };
@@ -449,6 +583,7 @@ async fn spawn_claude(
         None => {
             error!(provider, "No stdout from CLI process");
             let _ = tx.send(ChatResponse::error("No stdout from claude", None, provider));
+            cleanup_temp_images(temp_dir).await;
             return;
         }
     };
@@ -555,6 +690,7 @@ async fn spawn_claude(
                 info!(provider, %session_id, "Session aborted");
                 let _ = tx.send(ChatResponse::complete(&session_id, provider, 1, true));
                 state.active_sessions.remove(&format!("{provider}:{session_id}"));
+                cleanup_temp_images(temp_dir).await;
                 return;
             }
             _ = tokio::time::sleep_until(last_activity + INACTIVITY_TIMEOUT) => {
@@ -569,13 +705,14 @@ async fn spawn_claude(
         }
     }
 
-    // Process finished — clean up active session
+    // Process finished — clean up active session and temp images
     let real_key = if session_id.is_empty() {
         session_key
     } else {
         format!("{provider}:{session_id}")
     };
     state.active_sessions.remove(&real_key);
+    cleanup_temp_images(temp_dir).await;
     info!(provider, %session_id, exit_code = 0, "Process completed");
     let _ = tx.send(ChatResponse::complete(&session_id, provider, 0, false));
 }

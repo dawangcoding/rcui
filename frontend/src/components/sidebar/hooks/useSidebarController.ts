@@ -108,7 +108,6 @@ export function useSidebarController({
   const [deletingProjects, setDeletingProjects] = useState<Set<string>>(new Set());
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteProjectConfirmation | null>(null);
   const [sessionDeleteConfirmation, setSessionDeleteConfirmation] = useState<SessionDeleteConfirmation | null>(null);
-  const [showVersionModal, setShowVersionModal] = useState(false);
   const [starredProjects, setStarredProjects] = useState<Set<string>>(() => loadStarredProjects());
   const [searchMode, setSearchMode] = useState<'projects' | 'conversations'>('projects');
   const [conversationResults, setConversationResults] = useState<ConversationSearchResults | null>(null);
@@ -597,7 +596,6 @@ export function useSidebarController({
     deletingProjects,
     deleteConfirmation,
     sessionDeleteConfirmation,
-    showVersionModal,
     starredProjects,
     filteredProjects,
     toggleProject,
@@ -640,6 +638,5 @@ export function useSidebarController({
     setSearchFilter,
     setDeleteConfirmation,
     setSessionDeleteConfirmation,
-    setShowVersionModal,
   };
 }

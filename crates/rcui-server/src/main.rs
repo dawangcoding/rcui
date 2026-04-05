@@ -84,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/projects", get(routes::projects::list_projects))
         .route("/api/projects/add", post(routes::projects::add_project))
         .route(
+            "/api/projects/create-workspace",
+            post(routes::projects::create_workspace),
+        )
+        .route(
             "/api/projects/{projectName}/rename",
             put(routes::projects::rename_project),
         )

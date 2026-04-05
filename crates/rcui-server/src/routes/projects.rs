@@ -83,6 +83,67 @@ pub async fn add_project(
     })))
 }
 
+/// POST /api/projects/create-workspace — Create a workspace (new or existing) and add as project.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWorkspaceRequest {
+    pub workspace_type: String,
+    pub path: String,
+}
+
+pub async fn create_workspace(
+    _auth: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateWorkspaceRequest>,
+) -> Result<Json<Value>, AppError> {
+    let workspace_path = body.path.trim().to_string();
+    if workspace_path.is_empty() {
+        return Err(AppError::BadRequest("Path is required".to_string()));
+    }
+
+    // Expand ~ to home directory
+    let expanded_path = if workspace_path.starts_with("~/") {
+        let home = dirs::home_dir().unwrap_or_default();
+        home.join(&workspace_path[2..]).to_string_lossy().to_string()
+    } else {
+        workspace_path.clone()
+    };
+
+    let path = std::path::PathBuf::from(&expanded_path);
+
+    // If workspace type is "new", create the directory
+    if body.workspace_type == "new" {
+        if !path.exists() {
+            tokio::fs::create_dir_all(&path).await.map_err(|e| {
+                AppError::BadRequest(format!("Failed to create directory: {e}"))
+            })?;
+            info!(path = %expanded_path, "Created new workspace directory");
+        }
+    } else if !path.exists() {
+        return Err(AppError::BadRequest(format!(
+            "Directory does not exist: {expanded_path}"
+        )));
+    }
+
+    let project_name = project_scanner::add_project_manually(&expanded_path).await?;
+
+    // Invalidate cache
+    {
+        let mut cache = state.project_cache.write().await;
+        *cache = None;
+    }
+
+    info!(%project_name, path = %expanded_path, "Workspace created and project added");
+
+    Ok(Json(json!({
+        "success": true,
+        "project": {
+            "name": project_name,
+            "path": expanded_path
+        }
+    })))
+}
+
 /// PUT /api/projects/:projectName/rename — Rename a project.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -29,7 +29,8 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
     switch (msg.kind) {
       case 'text': {
         const content = msg.content || '';
-        if (!content.trim()) continue;
+        const hasImages = msg.images && msg.images.length > 0;
+        if (!content.trim() && !hasImages) continue;
 
         if (msg.role === 'user') {
           // Parse task notifications
@@ -44,10 +45,15 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
               taskStatus: taskNotifMatch[1]?.trim() || 'completed',
             });
           } else {
+            // Convert backend ImageData to frontend ChatImage format
+            const images = hasImages
+              ? msg.images!.map((img) => ({ name: img.name, data: img.data }))
+              : undefined;
             converted.push({
               type: 'user',
               content: unescapeWithMathProtection(decodeHtmlEntities(content)),
               timestamp: msg.timestamp,
+              images,
             });
           }
         } else {

@@ -346,7 +346,10 @@ pub async fn read_file(
             std::io::ErrorKind::PermissionDenied => {
                 AppError::BadRequest("Permission denied".into())
             }
-            _ => AppError::Internal(e.into()),
+            std::io::ErrorKind::InvalidData => {
+                AppError::BadRequest("File is binary and cannot be read as text".into())
+            }
+            _ => AppError::BadRequest(format!("Cannot read file as text: {e}")),
         }
     })?;
 
@@ -381,6 +384,48 @@ pub async fn read_file_content(
     })?;
 
     let mime = mime_guess::from_path(&file_path)
+        .first_or_octet_stream()
+        .to_string();
+
+    Ok(([(axum::http::header::CONTENT_TYPE, mime)], data))
+}
+
+/// GET /api/files/raw?path=... — Read a file by absolute path as binary (authenticated).
+/// Used for serving image previews from session conversations where the file path
+/// may be outside the project directory (e.g. .tmp/images/).
+#[derive(Deserialize)]
+pub struct RawFileQuery {
+    pub path: String,
+}
+
+pub async fn read_raw_file(
+    _auth: AuthUser,
+    Query(query): Query<RawFileQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    if query.path.contains('\0') {
+        return Err(AppError::BadRequest("Invalid file path".into()));
+    }
+
+    let file_path = std::path::Path::new(&query.path);
+    if !file_path.is_absolute() {
+        return Err(AppError::BadRequest("Path must be absolute".into()));
+    }
+
+    let canonical = file_path
+        .canonicalize()
+        .map_err(|_| AppError::NotFound("File not found".into()))?;
+
+    let data = tokio::fs::read(&canonical).await.map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            AppError::NotFound(format!("File not found: {}", canonical.display()))
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            AppError::BadRequest("Permission denied".into())
+        }
+        _ => AppError::Internal(e.into()),
+    })?;
+
+    let mime = mime_guess::from_path(&canonical)
         .first_or_octet_stream()
         .to_string();
 

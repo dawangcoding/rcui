@@ -6,6 +6,7 @@ use crate::error::AppError;
 use crate::providers::ProviderAdapter;
 use crate::providers::types::*;
 use crate::providers::utils::is_internal_content;
+use base64::Engine;
 
 pub struct ClaudeAdapter;
 
@@ -181,6 +182,10 @@ impl ProviderAdapter for ClaudeAdapter {
 
             if role == "user" {
                 if let Some(content_arr) = content.and_then(|c| c.as_array()) {
+                    // Collect images from content blocks so we can attach them
+                    // to the user text message.
+                    let mut collected_images: Vec<ImageData> = Vec::new();
+
                     for part in content_arr {
                         let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         match part_type {
@@ -228,7 +233,34 @@ impl ProviderAdapter for ClaudeAdapter {
                                     messages.push(m);
                                 }
                             }
+                            "image" => {
+                                if let Some(image_data) = extract_image_data(part) {
+                                    collected_images.push(image_data);
+                                }
+                            }
                             _ => {}
+                        }
+                    }
+
+                    // Attach collected images to the last user text message,
+                    // or create a standalone image message if no text was found.
+                    if !collected_images.is_empty() {
+                        if let Some(last_text) = messages.iter_mut().rev().find(|m| {
+                            m.kind == MessageKind::Text && m.role.as_deref() == Some("user")
+                        }) {
+                            last_text.images = Some(collected_images);
+                        } else {
+                            let mut m = NormalizedMessage::new(
+                                MessageKind::Text,
+                                provider,
+                                session_id,
+                            );
+                            m.id = format!("{base_id}_img");
+                            m.timestamp = ts.clone();
+                            m.role = Some("user".to_string());
+                            m.content = Some(String::new());
+                            m.images = Some(collected_images);
+                            messages.push(m);
                         }
                     }
                 } else if let Some(text) = content.and_then(|c| c.as_str()) {
@@ -322,5 +354,104 @@ impl ProviderAdapter for ClaudeAdapter {
         }
 
         messages
+    }
+}
+
+/// Extract image data from a Claude "image" content block.
+///
+/// Claude stores images in two formats:
+/// 1. Base64 inline: `{ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "..." } }`
+/// 2. URL reference: `{ "type": "image", "source": { "type": "url", "url": "http://..." } }`
+///
+/// For base64 sources, we produce a `data:` URI.
+/// For URL sources, we use the URL directly (the browser will attempt to load it).
+/// For file sources, we attempt to read the file and produce a `data:` URI.
+fn extract_image_data(part: &Value) -> Option<ImageData> {
+    let source = part.get("source")?;
+    let source_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match source_type {
+        "base64" => {
+            let media_type = source
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(|v| v.as_str())?;
+            let data_uri = format!("data:{media_type};base64,{data}");
+            Some(ImageData {
+                name: format!("image.{}", media_type_to_ext(media_type)),
+                data: data_uri,
+                mime_type: media_type.to_string(),
+            })
+        }
+        "url" => {
+            let url = source.get("url").and_then(|v| v.as_str())?;
+            let media_type = source
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
+            Some(ImageData {
+                name: url_to_filename(url, media_type),
+                data: url.to_string(),
+                mime_type: media_type.to_string(),
+            })
+        }
+        "file" => {
+            // File source: read from disk and encode as base64 data URI
+            let path = source.get("path").and_then(|v| v.as_str())?;
+            let media_type = source
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    mime_guess::from_path(path)
+                        .first_raw()
+                        .unwrap_or("image/png")
+                });
+            let file_path = std::path::Path::new(path);
+            if file_path.exists() {
+                if let Ok(bytes) = std::fs::read(file_path) {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    let data_uri = format!("data:{media_type};base64,{encoded}");
+                    let file_name = file_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image.png")
+                        .to_string();
+                    return Some(ImageData {
+                        name: file_name,
+                        data: data_uri,
+                        mime_type: media_type.to_string(),
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn media_type_to_ext(media_type: &str) -> &str {
+    match media_type {
+        "image/jpeg" => "jpeg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        _ => "png",
+    }
+}
+
+fn url_to_filename(url: &str, media_type: &str) -> String {
+    let ext = media_type_to_ext(media_type);
+    let last_segment = url.rsplit('/').next().unwrap_or("image");
+    let name = if last_segment.len() > 20 {
+        &last_segment[..20]
+    } else {
+        last_segment
+    };
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{name}.{ext}")
     }
 }

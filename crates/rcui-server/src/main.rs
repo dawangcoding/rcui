@@ -113,6 +113,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/projects/{projectName}/files/content",
             get(routes::projects::read_file_content),
         )
+        .route(
+            "/api/files/raw",
+            get(routes::projects::read_raw_file),
+        )
         // Session routes
         .route(
             "/api/projects/{projectName}/sessions",

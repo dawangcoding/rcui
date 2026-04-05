@@ -56,6 +56,8 @@ export default function CodeEditor({
     saveSuccess,
     saveError,
     isBinary,
+    isImage,
+    imageUrl,
     handleSave,
     handleDownload,
   } = useCodeEditorDocument({
@@ -172,6 +174,67 @@ export default function CodeEditor({
         title={t('binaryFile.title', 'Binary File')}
         message={t('binaryFile.message', 'The file "{{fileName}}" cannot be displayed in the text editor because it is a binary file.', { fileName: file.name })}
       />
+    );
+  }
+
+  // Image file preview
+  if (isImage) {
+    const containerClassName = isSidebar
+      ? 'w-full h-full flex flex-col bg-background'
+      : `fixed inset-0 z-[9999] md:bg-black/50 md:flex md:items-center md:justify-center md:p-4 ${isFullscreen ? 'md:p-0' : ''}`;
+
+    const innerClassName = isSidebar
+      ? 'bg-background flex flex-col w-full h-full'
+      : `bg-background shadow-2xl flex flex-col w-full h-full md:rounded-lg md:shadow-2xl${
+          isFullscreen ? ' md:w-full md:h-full md:rounded-none' : ' md:w-full md:max-w-6xl md:h-[80vh] md:max-h-[80vh]'
+        }`;
+
+    return (
+      <div className={containerClassName}>
+        <div className={innerClassName}>
+          <CodeEditorHeader
+            file={file}
+            isSidebar={isSidebar}
+            isFullscreen={isFullscreen}
+            isMarkdownFile={false}
+            markdownPreview={false}
+            saving={false}
+            saveSuccess={false}
+            onToggleMarkdownPreview={() => {}}
+            onOpenSettings={() => window.openSettings?.('appearance')}
+            onDownload={handleDownload}
+            onSave={handleSave}
+            onToggleFullscreen={() => setIsFullscreen((previous) => !previous)}
+            onClose={onClose}
+            labels={{
+              showingChanges: t('header.showingChanges'),
+              editMarkdown: t('actions.editMarkdown'),
+              previewMarkdown: t('actions.previewMarkdown'),
+              settings: t('toolbar.settings'),
+              download: t('actions.download'),
+              save: t('actions.save'),
+              saving: t('actions.saving'),
+              saved: t('actions.saved'),
+              fullscreen: t('actions.fullscreen'),
+              exitFullscreen: t('actions.exitFullscreen'),
+              close: t('actions.close'),
+            }}
+          />
+          <div className="flex-1 overflow-auto flex items-center justify-center p-4 bg-neutral-100 dark:bg-neutral-900">
+            {imageUrl ? (
+              <img
+                src={imageUrl}
+                alt={file.name}
+                className="max-w-full max-h-full object-contain rounded shadow-lg"
+              />
+            ) : (
+              <div className="text-muted-foreground text-sm">
+                {t('binaryFile.message', 'Unable to load image preview for "{{fileName}}"', { fileName: file.name })}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
     );
   }
 

@@ -39,7 +39,7 @@ export interface NormalizedMessage {
   // kind-specific fields (flat for simplicity)
   role?: 'user' | 'assistant';
   content?: string;
-  images?: string[];
+  images?: Array<{ name: string; data: string; mimeType: string }>;
   toolName?: string;
   toolInput?: unknown;
   toolId?: string;

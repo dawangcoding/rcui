@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api } from '../../../utils/api';
+import { api, authenticatedFetch } from '../../../utils/api';
 import type { CodeEditorFile } from '../types/types';
 import { isBinaryFile } from '../utils/binaryFile';
+
+const IMAGE_EXTENSIONS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'bmp',
+]);
+
+function isImageFile(filename: string): boolean {
+  const ext = filename.split('.').pop()?.toLowerCase();
+  return Boolean(ext && IMAGE_EXTENSIONS.has(ext));
+}
 
 type UseCodeEditorDocumentParams = {
   file: CodeEditorFile;
@@ -23,6 +32,8 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [isBinary, setIsBinary] = useState(false);
+  const [isImage, setIsImage] = useState(false);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
   const fileProjectName = file.projectName ?? projectPath;
   const filePath = file.path;
   const fileName = file.name;
@@ -30,14 +41,37 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
   const fileDiffOldString = file.diffInfo?.old_string;
 
   useEffect(() => {
+    let objectUrl: string | null = null;
+
     const loadFileContent = async () => {
       try {
         setLoading(true);
         setIsBinary(false);
+        setIsImage(false);
+        setImageUrl(null);
 
         // Check if file is binary by extension
         if (isBinaryFile(file.name)) {
           setIsBinary(true);
+          setLoading(false);
+          return;
+        }
+
+        // Check if file is an image — load via binary content endpoint
+        if (isImageFile(file.name)) {
+          setIsImage(true);
+          // Use absolute-path endpoint for absolute paths (e.g. .tmp/images/),
+          // otherwise fall back to project-scoped endpoint.
+          const isAbsolute = filePath.startsWith('/');
+          const contentUrl = isAbsolute
+            ? `/api/files/raw?path=${encodeURIComponent(filePath)}`
+            : `/api/projects/${fileProjectName}/files/content?path=${encodeURIComponent(filePath)}`;
+          const response = await authenticatedFetch(contentUrl);
+          if (response.ok) {
+            const blob = await response.blob();
+            objectUrl = URL.createObjectURL(blob);
+            setImageUrl(objectUrl);
+          }
           setLoading(false);
           return;
         }
@@ -70,6 +104,12 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
     };
 
     loadFileContent();
+
+    return () => {
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
   }, [file.diffInfo, file.name, fileDiffNewString, fileDiffOldString, fileName, filePath, fileProjectName]);
 
   const handleSave = useCallback(async () => {
@@ -131,6 +171,8 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
     saveSuccess,
     saveError,
     isBinary,
+    isImage,
+    imageUrl,
     handleSave,
     handleDownload,
   };

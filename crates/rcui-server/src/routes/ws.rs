@@ -4,12 +4,12 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::auth;
 use crate::services::chat::{execute_command, ChatCommand, ChatResponse};
-use crate::state::AppState;
+use crate::state::{AppState, BroadcastMessage};
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -58,12 +58,60 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: Option<
 
     info!(user_id = ?user_id, "WebSocket connection established");
 
-    // Spawn a task to forward chat responses to the WebSocket
+    // Subscribe to broadcast channel for project/session updates
+    let mut broadcast_rx = state.broadcast_tx.subscribe();
+    let forward_state = state.clone();
+
+    // Spawn a task to forward chat responses AND broadcast messages to the WebSocket
     let forward_task = tokio::spawn(async move {
-        while let Some(response) = chat_rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&response) {
-                if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                    break;
+        loop {
+            tokio::select! {
+                response = chat_rx.recv() => {
+                    match response {
+                        Some(resp) => {
+                            if let Ok(json) = serde_json::to_string(&resp) {
+                                if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                broadcast = broadcast_rx.recv() => {
+                    let msg = match broadcast {
+                        Ok(BroadcastMessage::ProjectsUpdated { changed_file, .. }) => {
+                            let projects = {
+                                let cache = forward_state.project_cache.read().await;
+                                cache.clone().unwrap_or_default()
+                            };
+                            serde_json::json!({
+                                "type": "projects_updated",
+                                "projects": projects,
+                                "changedFile": changed_file,
+                            })
+                        }
+                        Ok(BroadcastMessage::LoadingProgress { progress, message }) => {
+                            let phase = if progress >= 100 { "complete" } else { "scanning" };
+                            serde_json::json!({
+                                "type": "loading_progress",
+                                "phase": phase,
+                                "current": progress,
+                                "total": 100,
+                                "currentProject": message,
+                            })
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("Broadcast receiver lagged by {n} messages");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }

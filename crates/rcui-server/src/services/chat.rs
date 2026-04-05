@@ -10,6 +10,18 @@ use tracing::{debug, error, info, warn};
 
 use crate::state::AppState;
 
+/// Generate a unique message ID for WebSocket messages.
+fn gen_msg_id() -> String {
+    format!(
+        "ws_{}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        uuid::Uuid::new_v4().as_simple(),
+    )
+}
+
 // ─── Incoming Messages (Client → Server) ─────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +97,8 @@ pub struct CommandOptions {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse {
+    /// Unique message ID required by the frontend session store for deduplication.
+    pub id: String,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -178,6 +192,7 @@ impl ChatResponse {
 
     fn empty() -> Self {
         Self {
+            id: gen_msg_id(),
             kind: String::new(),
             content: None,
             session_id: None,

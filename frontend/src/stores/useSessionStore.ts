@@ -126,6 +126,8 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
   }
 
   const extra = realtime.filter(m => {
+    // Skip messages without an id (malformed WebSocket payloads)
+    if (!m.id) return true;
     // ID-based dedup (original logic)
     if (serverIds.has(m.id)) return false;
     // Content-based dedup for local user messages

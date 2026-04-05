@@ -290,3 +290,26 @@ app.fallback_service(ServeDir::new(static_dir).fallback(ServeFile::new(index_fil
 - 使用 `cargo fmt` 的代码风格
 - 避免手动格式化，让工具自动处理
 - 需要绕过时，可用 Python 脚本或 bash 直接操作文件
+
+## 参考文档
+
+### Claude Agent SDK 架构参考
+实现或修改 Claude 相关功能（`providers/claude/`、WebSocket chat、session 管理等）时，**必须参考**：
+
+- **文档路径**: `docs/claude-agent-sdk-architecture.md`
+- **基于版本**: `@anthropic-ai/claude-agent-sdk` v0.2.92
+- **核心内容**:
+  - SDK 系统架构（进程 spawn + IPC 通信模式）
+  - SDKMessage 消息协议（20+ 种消息类型的完整定义）
+  - JSONL 会话文件格式（`~/.claude/projects/` 下的存储结构）
+  - V1 `query()` / V2 `SDKSession` API 接口
+  - canUseTool 权限回调机制
+  - Hook 系统（27 种事件）
+  - MCP 集成（4 种服务器类型）
+  - Bridge 远程会话（CCR 连接）
+
+**适用场景**:
+- 解析 Claude 会话 JSONL 文件时，参考 SDKMessage 类型体系
+- 实现 WebSocket chat 命令分发时，参考 query 数据流和控制请求通道
+- 添加新的 session 管理功能时，参考会话持久化 API（listSessions, getSessionMessages 等）
+- 对接 Claude Agent SDK 编程接口时，参考 V1/V2 API 和 Transport 抽象

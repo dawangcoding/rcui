@@ -62,3 +62,7 @@ async-trait = "0.1"
 
 # Stream utilities
 futures-util = "0.3"
+
+# PTY (pseudo-terminal)
+portable-pty = "0.9"
+regex = "1"

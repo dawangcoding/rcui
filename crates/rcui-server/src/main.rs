@@ -74,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(routes::health::health_check))
         // WebSocket
         .route("/ws", get(routes::ws::ws_handler))
+        .route("/shell", get(routes::shell::shell_handler))
         // Auth routes (public)
         .route("/api/auth/status", get(routes::auth::status))
         .route("/api/auth/register", post(routes::auth::register))

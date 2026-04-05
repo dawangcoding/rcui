@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use portable_pty::MasterPty;
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 use crate::config::AppConfig;
 
@@ -29,12 +31,32 @@ pub struct ActiveSession {
     pub stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
-/// PTY session info for shell WebSocket reuse.
+/// Maximum number of entries in the PTY circular replay buffer.
+pub const PTY_BUFFER_CAP: usize = 5000;
+
+/// PTY session for interactive shell WebSocket.
 pub struct PtySession {
+    /// PTY master handle — used for resize operations.
+    pub master: Box<dyn MasterPty + Send>,
+    /// PTY master writer — used to send input to the child process.
+    pub writer: Box<dyn Write + Send>,
+    /// Child process handle.
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Project path this session was spawned in.
     pub project_path: String,
+    /// Session ID (may be empty for plain-shell).
     pub session_id: String,
-    pub buffer: Vec<String>,
-    // PTY master will be added when portable-pty is integrated
+    /// Provider name (claude, cursor, codex, gemini, plain-shell).
+    pub provider: String,
+    /// Circular replay buffer for reconnection.
+    pub buffer: VecDeque<String>,
+    /// Channel to forward PTY output to the currently attached WebSocket.
+    /// `None` when no WebSocket is connected (session is idle/detached).
+    pub ws_tx: Option<mpsc::UnboundedSender<String>>,
+    /// Background task that reads from PTY stdout and forwards output.
+    pub reader_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Delayed cleanup task (spawned on WebSocket disconnect, cancelled on reconnect).
+    pub cleanup_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Central application state shared across all handlers.
@@ -54,7 +76,7 @@ pub struct AppState {
     /// Active CLI sessions per provider: key = "provider:session_id"
     pub active_sessions: DashMap<String, Arc<Mutex<ActiveSession>>>,
 
-    /// PTY sessions for shell WebSocket reuse
+    /// PTY sessions for shell WebSocket reuse: key = session_key
     pub pty_sessions: Arc<Mutex<HashMap<String, PtySession>>>,
 
     /// Cached project list

@@ -6,5 +6,6 @@ pub mod mcp;
 pub mod projects;
 pub mod sessions;
 pub mod settings;
+pub mod shell;
 pub mod user;
 pub mod ws;

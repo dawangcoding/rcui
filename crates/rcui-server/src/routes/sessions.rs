@@ -123,6 +123,45 @@ pub async fn delete_session(
     Ok(Json(json!({ "success": true })))
 }
 
+/// DELETE /api/projects/:projectName/sessions/:sessionId — Delete a session (project-scoped).
+pub async fn delete_project_session(
+    _auth: AuthUser,
+    State(_state): State<Arc<AppState>>,
+    Path((project_name, session_id)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    info!(%session_id, %project_name, "Deleting project session");
+
+    project_scanner::delete_session(&project_name, &session_id, "claude").await?;
+
+    Ok(Json(json!({ "success": true })))
+}
+
+/// DELETE /api/codex/sessions/:sessionId — Delete a Codex session.
+pub async fn delete_codex_session(
+    _auth: AuthUser,
+    State(_state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    info!(%session_id, "Deleting Codex session");
+
+    project_scanner::delete_session("", &session_id, "codex").await?;
+
+    Ok(Json(json!({ "success": true })))
+}
+
+/// DELETE /api/gemini/sessions/:sessionId — Delete a Gemini session.
+pub async fn delete_gemini_session(
+    _auth: AuthUser,
+    State(_state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    info!(%session_id, "Deleting Gemini session");
+
+    project_scanner::delete_session("", &session_id, "gemini").await?;
+
+    Ok(Json(json!({ "success": true })))
+}
+
 /// POST /api/sessions/:sessionId/name — Set custom session name.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

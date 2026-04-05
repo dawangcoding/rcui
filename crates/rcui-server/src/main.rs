@@ -97,12 +97,24 @@ async fn main() -> anyhow::Result<()> {
             get(routes::sessions::list_sessions),
         )
         .route(
+            "/api/projects/{projectName}/sessions/{sessionId}",
+            delete(routes::sessions::delete_project_session),
+        )
+        .route(
             "/api/sessions/{sessionId}/messages",
             get(routes::sessions::get_session_messages),
         )
         .route(
             "/api/sessions/{sessionId}",
             delete(routes::sessions::delete_session),
+        )
+        .route(
+            "/api/codex/sessions/{sessionId}",
+            delete(routes::sessions::delete_codex_session),
+        )
+        .route(
+            "/api/gemini/sessions/{sessionId}",
+            delete(routes::sessions::delete_gemini_session),
         )
         .route(
             "/api/sessions/{sessionId}/name",

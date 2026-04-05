@@ -106,12 +106,40 @@ function createEmptySlot(): SessionSlot {
  * Compute merged messages: server + realtime, deduped by id.
  * Server messages take priority (they're the persisted source of truth).
  * Realtime messages that aren't yet in server stay (in-flight streaming).
+ *
+ * Local user messages (id starts with "local_") are also deduped by content
+ * against server user messages. This prevents duplicates when the server
+ * catches up with an optimistically-added user message that has a different id.
  */
 function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[]): NormalizedMessage[] {
   if (realtime.length === 0) return server;
   if (server.length === 0) return realtime;
   const serverIds = new Set(server.map(m => m.id));
-  const extra = realtime.filter(m => !serverIds.has(m.id));
+
+  // Build content-based dedup set for server user-text messages so local
+  // optimistic user messages are recognised even when IDs differ.
+  const serverUserContents = new Set<string>();
+  for (const m of server) {
+    if (m.kind === 'text' && m.role === 'user' && m.content) {
+      serverUserContents.add(m.content);
+    }
+  }
+
+  const extra = realtime.filter(m => {
+    // ID-based dedup (original logic)
+    if (serverIds.has(m.id)) return false;
+    // Content-based dedup for local user messages
+    if (
+      m.id.startsWith('local_') &&
+      m.kind === 'text' &&
+      m.role === 'user' &&
+      m.content &&
+      serverUserContents.has(m.content)
+    ) {
+      return false;
+    }
+    return true;
+  });
   if (extra.length === 0) return server;
   return [...server, ...extra];
 }

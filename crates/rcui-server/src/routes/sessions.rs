@@ -30,7 +30,7 @@ pub struct SessionsQuery {
 /// GET /api/projects/:projectName/sessions — List sessions for a project.
 pub async fn list_sessions(
     _auth: AuthUser,
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(project_name): Path<String>,
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -39,8 +39,23 @@ pub async fn list_sessions(
 
     debug!(%project_name, ?limit, offset, "Listing sessions");
 
-    let (sessions, total, has_more) =
+    let (mut sessions, total, has_more) =
         project_scanner::get_claude_sessions(&project_name, limit, offset).await;
+
+    // Apply custom session names
+    let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
+    if !session_ids.is_empty() {
+        if let Ok(names) =
+            db::session_names::get_names_batch(&state.db, &session_ids, "claude").await
+        {
+            for session in sessions.iter_mut() {
+                if let Some(custom_name) = names.get(&session.id) {
+                    session.name = Some(custom_name.clone());
+                    session.summary = custom_name.clone();
+                }
+            }
+        }
+    }
 
     debug!(%project_name, total, has_more, "Sessions listed");
 
@@ -163,6 +178,33 @@ pub async fn delete_gemini_session(
     Ok(Json(json!({ "success": true })))
 }
 
+/// PUT /api/sessions/:sessionId/rename — Rename session (frontend compat).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSessionRequest {
+    pub summary: String,
+    pub provider: Option<String>,
+}
+
+pub async fn rename_session(
+    _auth: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(body): Json<RenameSessionRequest>,
+) -> Result<Json<Value>, AppError> {
+    let provider = body.provider.as_deref().unwrap_or("claude");
+    debug!(%session_id, %provider, name = %body.summary, "Renaming session");
+    db::session_names::set_name(&state.db, &session_id, provider, &body.summary).await?;
+
+    // Invalidate project cache so refresh returns updated names
+    {
+        let mut cache = state.project_cache.write().await;
+        *cache = None;
+    }
+
+    Ok(Json(json!({ "success": true })))
+}
+
 /// POST /api/sessions/:sessionId/name — Set custom session name.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -180,6 +222,13 @@ pub async fn set_session_name(
     let provider = body.provider.as_deref().unwrap_or("claude");
     debug!(%session_id, %provider, name = %body.name, "Setting session name");
     db::session_names::set_name(&state.db, &session_id, provider, &body.name).await?;
+
+    // Invalidate project cache so refresh returns updated names
+    {
+        let mut cache = state.project_cache.write().await;
+        *cache = None;
+    }
+
     Ok(Json(json!({ "success": true })))
 }
 

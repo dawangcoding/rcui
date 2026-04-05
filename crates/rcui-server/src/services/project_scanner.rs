@@ -586,7 +586,7 @@ pub async fn get_gemini_cli_sessions(project_path: &str) -> Vec<SessionInfo> {
 
 /// Discover all projects from all provider directories.
 pub async fn get_projects(
-    _pool: &sqlx::SqlitePool,
+    pool: &sqlx::SqlitePool,
     progress_tx: Option<tokio::sync::mpsc::Sender<ProgressEvent>>,
 ) -> Vec<Project> {
     tracing::debug!("Starting project discovery scan");
@@ -726,8 +726,62 @@ pub async fn get_projects(
         b_latest.cmp(&a_latest)
     });
 
+    // Apply custom session names from database
+    apply_custom_session_names(pool, &mut projects).await;
+
     tracing::debug!(project_count = projects.len(), "Project discovery scan complete");
     projects
+}
+
+/// Apply custom names from session_names DB table to session lists.
+async fn apply_custom_session_names(pool: &sqlx::SqlitePool, projects: &mut [Project]) {
+    let providers = ["claude", "cursor", "codex", "gemini"];
+    for provider in providers {
+        let session_ids: Vec<String> = projects
+            .iter()
+            .flat_map(|p| match provider {
+                "claude" => p.sessions.iter(),
+                "cursor" => p.cursor_sessions.iter(),
+                "codex" => p.codex_sessions.iter(),
+                "gemini" => p.gemini_sessions.iter(),
+                _ => [].iter(),
+            })
+            .map(|s| s.id.clone())
+            .collect();
+
+        if session_ids.is_empty() {
+            continue;
+        }
+
+        let names =
+            match crate::db::session_names::get_names_batch(pool, &session_ids, provider).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(%provider, "Failed to fetch custom session names: {e}");
+                    continue;
+                }
+            };
+
+        if names.is_empty() {
+            continue;
+        }
+
+        for project in projects.iter_mut() {
+            let sessions = match provider {
+                "claude" => &mut project.sessions,
+                "cursor" => &mut project.cursor_sessions,
+                "codex" => &mut project.codex_sessions,
+                "gemini" => &mut project.gemini_sessions,
+                _ => continue,
+            };
+            for session in sessions.iter_mut() {
+                if let Some(custom_name) = names.get(&session.id) {
+                    session.name = Some(custom_name.clone());
+                    session.summary = custom_name.clone();
+                }
+            }
+        }
+    }
 }
 
 fn most_recent_activity(project: &Project) -> String {

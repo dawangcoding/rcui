@@ -172,6 +172,10 @@ async fn main() -> anyhow::Result<()> {
             delete(routes::sessions::delete_gemini_session),
         )
         .route(
+            "/api/sessions/{sessionId}/rename",
+            put(routes::sessions::rename_session),
+        )
+        .route(
             "/api/sessions/{sessionId}/name",
             post(routes::sessions::set_session_name)
                 .delete(routes::sessions::delete_session_name),

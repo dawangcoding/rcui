@@ -229,15 +229,20 @@ struct ImageProcessingResult {
 
 /// Save base64 data-URI images to temporary files and append their paths to the prompt.
 /// Returns the modified prompt and the temp directory path for cleanup.
-async fn handle_images(command: &str, images: &[Value], cwd: &str) -> ImageProcessingResult {
+async fn handle_images(command: &str, images: &[Value]) -> ImageProcessingResult {
     let mut temp_image_paths = Vec::new();
-    let temp_dir = std::path::PathBuf::from(cwd)
-        .join(".tmp")
+    let temp_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".rcui")
+        .join("tmp")
         .join("images")
-        .join(format!("{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()));
+        .join(format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
 
     if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
         warn!(error = %e, "Failed to create temp image directory");
@@ -320,12 +325,23 @@ async fn handle_images(command: &str, images: &[Value], cwd: &str) -> ImageProce
     }
 }
 
-/// Clean up temporary image files and directory.
-async fn cleanup_temp_images(temp_dir: Option<std::path::PathBuf>) {
+/// Delay before cleaning up temporary image files.
+/// The CLI mode requires images on disk for Claude to read via tools, and the
+/// frontend may also load referenced files after the session completes.
+const IMAGE_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Schedule deferred cleanup of temporary image files and directory.
+fn schedule_temp_image_cleanup(temp_dir: Option<std::path::PathBuf>) {
     if let Some(dir) = temp_dir {
-        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-            warn!(error = %e, path = %dir.display(), "Failed to clean up temp image directory");
-        }
+        tokio::spawn(async move {
+            tokio::time::sleep(IMAGE_CLEANUP_DELAY).await;
+            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                // Directory may already be gone — that's fine.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(error = %e, path = %dir.display(), "Failed to clean up temp image directory");
+                }
+            }
+        });
     }
 }
 
@@ -476,7 +492,7 @@ async fn spawn_claude(
     // Handle images: save to temp files and modify prompt with file paths
     let image_result = if let Some(ref images) = opts.images {
         if !images.is_empty() {
-            Some(handle_images(&prompt, images, cwd).await)
+            Some(handle_images(&prompt, images).await)
         } else {
             None
         }
@@ -573,7 +589,7 @@ async fn spawn_claude(
                 None,
                 provider,
             ));
-            cleanup_temp_images(temp_dir).await;
+            schedule_temp_image_cleanup(temp_dir);
             return;
         }
     };
@@ -583,7 +599,7 @@ async fn spawn_claude(
         None => {
             error!(provider, "No stdout from CLI process");
             let _ = tx.send(ChatResponse::error("No stdout from claude", None, provider));
-            cleanup_temp_images(temp_dir).await;
+            schedule_temp_image_cleanup(temp_dir);
             return;
         }
     };
@@ -690,7 +706,7 @@ async fn spawn_claude(
                 info!(provider, %session_id, "Session aborted");
                 let _ = tx.send(ChatResponse::complete(&session_id, provider, 1, true));
                 state.active_sessions.remove(&format!("{provider}:{session_id}"));
-                cleanup_temp_images(temp_dir).await;
+                schedule_temp_image_cleanup(temp_dir);
                 return;
             }
             _ = tokio::time::sleep_until(last_activity + INACTIVITY_TIMEOUT) => {
@@ -712,7 +728,7 @@ async fn spawn_claude(
         format!("{provider}:{session_id}")
     };
     state.active_sessions.remove(&real_key);
-    cleanup_temp_images(temp_dir).await;
+    schedule_temp_image_cleanup(temp_dir);
     info!(provider, %session_id, exit_code = 0, "Process completed");
     let _ = tx.send(ChatResponse::complete(&session_id, provider, 0, false));
 }

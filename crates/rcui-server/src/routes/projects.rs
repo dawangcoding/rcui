@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -188,6 +189,359 @@ pub async fn delete_project(
         let mut cache = state.project_cache.write().await;
         *cache = None;
     }
+
+    Ok(Json(json!({ "success": true })))
+}
+
+// ─── File Tree ───────────────────────────────────────────────────────────────
+
+/// Directories to skip when building the file tree.
+const EXCLUDED_DIRS: &[&str] = &[
+    "node_modules",
+    "dist",
+    "build",
+    ".git",
+    ".svn",
+    ".hg",
+    "__pycache__",
+    ".DS_Store",
+    "target",
+];
+
+const MAX_DEPTH: usize = 10;
+
+/// Convert Unix permission mode to rwx string (e.g. "rwxr-xr-x").
+fn mode_to_rwx(mode: u32) -> String {
+    let mut s = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let bits = (mode >> shift) & 7;
+        s.push(if bits & 4 != 0 { 'r' } else { '-' });
+        s.push(if bits & 2 != 0 { 'w' } else { '-' });
+        s.push(if bits & 1 != 0 { 'x' } else { '-' });
+    }
+    s
+}
+
+/// Recursively build a file tree for the given directory.
+async fn build_file_tree(dir_path: &std::path::Path, depth: usize) -> Vec<Value> {
+    let mut items = Vec::new();
+
+    let mut entries = match tokio::fs::read_dir(dir_path).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::PermissionDenied {
+                debug!("Error reading directory {}: {e}", dir_path.display());
+            }
+            return items;
+        }
+    };
+
+    let mut collected = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        collected.push(entry);
+    }
+
+    for entry in collected {
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip excluded directories/files
+        if EXCLUDED_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+
+        let item_path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false);
+
+        // Gather stats
+        let (size, modified, permissions_rwx) = match tokio::fs::metadata(&item_path).await {
+            Ok(meta) => {
+                let size = meta.len();
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| {
+                        let dt: chrono::DateTime<chrono::Utc> = t.into();
+                        Some(dt.to_rfc3339())
+                    })
+                    .unwrap_or_default();
+                let mode = meta.permissions().mode();
+                let rwx = mode_to_rwx(mode & 0o777);
+                (size, modified, rwx)
+            }
+            Err(_) => (0, String::new(), "---------".to_string()),
+        };
+
+        let mut item = json!({
+            "name": name,
+            "path": item_path.to_string_lossy(),
+            "type": if is_dir { "directory" } else { "file" },
+            "size": size,
+            "modified": modified,
+            "permissionsRwx": permissions_rwx,
+        });
+
+        // Recurse into subdirectories
+        if is_dir && depth < MAX_DEPTH {
+            match tokio::fs::read_dir(&item_path).await {
+                Ok(_) => {
+                    let children =
+                        Box::pin(build_file_tree(&item_path, depth + 1)).await;
+                    item["children"] = Value::Array(children);
+                }
+                Err(_) => {
+                    item["children"] = Value::Array(vec![]);
+                }
+            }
+        }
+
+        items.push(item);
+    }
+
+    // Sort: directories first, then alphabetical by name
+    items.sort_by(|a, b| {
+        let a_type = a["type"].as_str().unwrap_or("");
+        let b_type = b["type"].as_str().unwrap_or("");
+        if a_type != b_type {
+            if a_type == "directory" {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        } else {
+            let a_name = a["name"].as_str().unwrap_or("").to_lowercase();
+            let b_name = b["name"].as_str().unwrap_or("").to_lowercase();
+            a_name.cmp(&b_name)
+        }
+    });
+
+    items
+}
+
+/// GET /api/projects/:projectName/files — List project file tree.
+pub async fn list_files(
+    _auth: AuthUser,
+    Path(project_name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let project_root = resolve_project_root(&project_name).await?;
+
+    debug!(project = %project_name, path = %project_root.display(), "Listing project files");
+
+    let files = build_file_tree(&project_root, 0).await;
+
+    Ok(Json(Value::Array(files)))
+}
+
+// ─── File Operations ─────────────────────────────────────────────────────────
+
+/// POST /api/projects/:projectName/files/create — Create a new file or directory.
+#[derive(Deserialize)]
+pub struct CreateFileRequest {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+    pub name: String,
+}
+
+pub async fn create_file(
+    _auth: AuthUser,
+    Path(project_name): Path<String>,
+    Json(body): Json<CreateFileRequest>,
+) -> Result<Json<Value>, AppError> {
+    let project_root = resolve_project_root(&project_name).await?;
+
+    let parent = if body.path.is_empty() {
+        project_root.clone()
+    } else {
+        let p = PathBuf::from(&body.path);
+        if p.is_absolute() {
+            p
+        } else {
+            project_root.join(&body.path)
+        }
+    };
+
+    let target = parent.join(&body.name);
+
+    // Validate path is within project
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.clone());
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|_| AppError::NotFound("Parent directory not found".into()))?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(AppError::BadRequest("Path traversal detected".into()));
+    }
+
+    if target.exists() {
+        return Err(AppError::Conflict(format!(
+            "{} already exists: {}",
+            if body.item_type == "directory" {
+                "Directory"
+            } else {
+                "File"
+            },
+            body.name
+        )));
+    }
+
+    if body.item_type == "directory" {
+        tokio::fs::create_dir_all(&target).await.map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("Failed to create directory: {e}"))
+        })?;
+    } else {
+        tokio::fs::write(&target, "").await.map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("Failed to create file: {e}"))
+        })?;
+    }
+
+    info!(name = %body.name, item_type = %body.item_type, "File/directory created");
+
+    Ok(Json(json!({ "success": true, "path": target.to_string_lossy() })))
+}
+
+/// PUT /api/projects/:projectName/files/rename — Rename a file or directory.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameFileRequest {
+    pub old_path: String,
+    pub new_name: String,
+}
+
+pub async fn rename_file(
+    _auth: AuthUser,
+    Path(project_name): Path<String>,
+    Json(body): Json<RenameFileRequest>,
+) -> Result<Json<Value>, AppError> {
+    let project_root = resolve_project_root(&project_name).await?;
+    let old_path = validate_within_project(&body.old_path, &project_root)?;
+
+    let new_path = old_path
+        .parent()
+        .ok_or_else(|| AppError::BadRequest("Invalid path".into()))?
+        .join(&body.new_name);
+
+    if new_path.exists() {
+        return Err(AppError::Conflict(format!(
+            "A file or directory named '{}' already exists",
+            body.new_name
+        )));
+    }
+
+    tokio::fs::rename(&old_path, &new_path).await.map_err(|e| {
+        AppError::Internal(anyhow::anyhow!("Failed to rename: {e}"))
+    })?;
+
+    info!(old = %old_path.display(), new = %new_path.display(), "File renamed");
+
+    Ok(Json(json!({ "success": true, "newPath": new_path.to_string_lossy() })))
+}
+
+/// DELETE /api/projects/:projectName/files — Delete a file or directory.
+#[derive(Deserialize)]
+pub struct DeleteFileRequest {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+}
+
+pub async fn delete_file(
+    _auth: AuthUser,
+    Path(project_name): Path<String>,
+    Json(body): Json<DeleteFileRequest>,
+) -> Result<Json<Value>, AppError> {
+    let project_root = resolve_project_root(&project_name).await?;
+    let target = validate_within_project(&body.path, &project_root)?;
+
+    if body.item_type == "directory" {
+        tokio::fs::remove_dir_all(&target).await.map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("Failed to delete directory: {e}"))
+        })?;
+    } else {
+        tokio::fs::remove_file(&target).await.map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("Failed to delete file: {e}"))
+        })?;
+    }
+
+    info!(path = %target.display(), "File/directory deleted");
+
+    Ok(Json(json!({ "success": true })))
+}
+
+/// POST /api/projects/:projectName/files/upload — Upload files to project directory.
+pub async fn upload_files(
+    _auth: AuthUser,
+    Path(project_name): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let project_root = resolve_project_root(&project_name).await?;
+    let mut uploaded = Vec::new();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart data: {e}")))?
+    {
+        let file_name = field.file_name().unwrap_or("unnamed").to_string();
+        if file_name.is_empty() {
+            continue;
+        }
+
+        // Prevent path traversal in file name
+        let safe_name = std::path::Path::new(&file_name)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file_name.clone());
+
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Failed to read upload: {e}")))?;
+
+        let target = project_root.join(&safe_name);
+        tokio::fs::write(&target, &data).await.map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("Failed to write file: {e}"))
+        })?;
+
+        uploaded.push(json!({
+            "name": safe_name,
+            "path": target.to_string_lossy(),
+            "size": data.len(),
+        }));
+
+        debug!(name = %safe_name, size = data.len(), "File uploaded");
+    }
+
+    info!(count = uploaded.len(), "Files uploaded to project");
+
+    Ok(Json(json!({ "success": true, "files": uploaded })))
+}
+
+/// PUT /api/projects/:projectName/file — Save/update a text file.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveFileRequest {
+    pub file_path: String,
+    pub content: String,
+}
+
+pub async fn save_file(
+    _auth: AuthUser,
+    Path(project_name): Path<String>,
+    Json(body): Json<SaveFileRequest>,
+) -> Result<Json<Value>, AppError> {
+    let project_root = resolve_project_root(&project_name).await?;
+    let file_path = validate_within_project(&body.file_path, &project_root)?;
+
+    tokio::fs::write(&file_path, &body.content)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to save file: {e}")))?;
+
+    info!(path = %file_path.display(), "File saved");
 
     Ok(Json(json!({ "success": true })))
 }

@@ -96,6 +96,29 @@ async fn main() -> anyhow::Result<()> {
             "/api/projects/{projectName}",
             delete(routes::projects::delete_project),
         )
+        // File tree and file operations
+        .route(
+            "/api/projects/{projectName}/files",
+            get(routes::projects::list_files)
+                .delete(routes::projects::delete_file),
+        )
+        .route(
+            "/api/projects/{projectName}/files/create",
+            post(routes::projects::create_file),
+        )
+        .route(
+            "/api/projects/{projectName}/files/rename",
+            put(routes::projects::rename_file),
+        )
+        // upload files: merge a sub-router with a larger body limit (30MB)
+        .merge(
+            Router::new()
+                .route(
+                    "/api/projects/{projectName}/files/upload",
+                    post(routes::projects::upload_files),
+                )
+                .layer(DefaultBodyLimit::max(30 * 1024 * 1024)),
+        )
         // upload-images: merge a sub-router with a larger body limit (30MB)
         .merge(
             Router::new()
@@ -107,7 +130,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/projects/{projectName}/file",
-            get(routes::projects::read_file),
+            get(routes::projects::read_file)
+                .put(routes::projects::save_file),
         )
         .route(
             "/api/projects/{projectName}/files/content",

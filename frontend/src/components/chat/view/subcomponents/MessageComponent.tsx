@@ -27,6 +27,7 @@ type MessageComponentProps = {
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   onShowSettings?: () => void;
   onGrantToolPermission?: (suggestion: ClaudePermissionSuggestion) => PermissionGrantResult | null | undefined;
+  onRetryAfterPermission?: () => void;
   autoExpandTools?: boolean;
   showRawParameters?: boolean;
   showThinking?: boolean;
@@ -43,7 +44,7 @@ type InteractiveOption = {
 type PermissionGrantState = 'idle' | 'granted' | 'error';
 const COPY_HIDDEN_TOOL_NAMES = new Set(['Bash', 'Edit', 'Write', 'ApplyPatch']);
 
-const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, onShowSettings, onGrantToolPermission, autoExpandTools, showRawParameters, showThinking, selectedProject, provider }: MessageComponentProps) => {
+const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, onShowSettings, onGrantToolPermission, onRetryAfterPermission, autoExpandTools, showRawParameters, showThinking, selectedProject, provider }: MessageComponentProps) => {
   const { t } = useTranslation('chat');
   const isGrouped = prevMessage && prevMessage.type === message.type &&
     ((prevMessage.type === 'assistant') ||
@@ -270,8 +271,22 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                               </div>
                             )}
                             {(permissionSuggestion.isAllowed || permissionGrantState === 'granted') && (
-                              <div className="mt-2 text-xs text-green-700 dark:text-green-200">
-                                {t('permissions.retry')}
+                              <div className="mt-2 flex items-center gap-2">
+                                <span className="text-xs text-green-700 dark:text-green-200">
+                                  {t('permissions.retry')}
+                                </span>
+                                {onRetryAfterPermission && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onRetryAfterPermission()}
+                                    className="inline-flex items-center gap-1 rounded-md border border-green-300/70 bg-green-50 px-2.5 py-1 text-xs font-medium text-green-700 transition-colors hover:bg-green-100 dark:border-green-800/60 dark:bg-green-900/30 dark:text-green-200 dark:hover:bg-green-900/50"
+                                  >
+                                    <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                    </svg>
+                                    {t('permissions.retryButton', { defaultValue: 'Retry' })}
+                                  </button>
+                                )}
                               </div>
                             )}
                           </div>

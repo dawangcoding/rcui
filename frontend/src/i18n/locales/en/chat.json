@@ -71,6 +71,7 @@
     "added": "Permission added",
     "addTo": "Adds {{entry}} to Allowed Tools.",
     "retry": "Permission saved. Retry the request to use the tool.",
+    "retryButton": "Retry",
     "error": "Unable to update permissions. Please try again.",
     "openSettings": "Open settings"
   },

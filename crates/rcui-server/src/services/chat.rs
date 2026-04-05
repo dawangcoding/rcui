@@ -784,6 +784,7 @@ fn parse_claude_stream_event(
     let mut msgs = Vec::new();
 
     let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    debug!(provider, %session_id, event_type = %kind, "Claude stream event received");
 
     match kind {
         "assistant" => {
@@ -1042,7 +1043,74 @@ fn parse_claude_stream_event(
             warn!(provider, %session_id, %error_msg, "Stream error event");
             msgs.push(ChatResponse::error(error_msg, Some(session_id), provider));
         }
+        // CLI emits "user" events for tool results (including permission denials).
+        "user" => {
+            if let Some(content) = event
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for part in content {
+                    let part_type =
+                        part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if part_type == "tool_result" {
+                        let tool_id = part
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let is_error = part
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let result_content = part
+                            .get("content")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        msgs.push(ChatResponse {
+                            kind: "tool_result".to_string(),
+                            tool_result: Some(json!({
+                                "content": result_content,
+                                "isError": is_error,
+                            })),
+                            tool_id,
+                            session_id: Some(session_id.to_string()),
+                            provider: provider.to_string(),
+                            ..ChatResponse::empty()
+                        });
+                    }
+                }
+            }
+        }
+        // CLI emits "system" events for init, api_retry, etc.
+        "system" => {
+            let subtype = event
+                .get("subtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match subtype {
+                "init" => {
+                    info!(
+                        provider,
+                        %session_id,
+                        cli_version = event.get("claude_code_version").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                        model = event.get("model").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                        permission_mode = event.get("permissionMode").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                        "Claude CLI init"
+                    );
+                }
+                "api_retry" => {
+                    let attempt = event.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    warn!(provider, %session_id, %attempt, %error, "API retry");
+                }
+                _ => {
+                    debug!(provider, %session_id, %subtype, "System event");
+                }
+            }
+        }
         _ => {
+            // Log unrecognized events for debugging
+            debug!(provider, %session_id, event_type = %kind, event = %event, "Unrecognized stream event");
             // Pass through other events as stream_delta if they have content
             if let Some(text) = event.get("content").and_then(|v| v.as_str()) {
                 msgs.push(ChatResponse::stream_delta(text, session_id, provider));

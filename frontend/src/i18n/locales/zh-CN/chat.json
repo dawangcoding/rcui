@@ -71,6 +71,7 @@
     "added": "权限已添加",
     "addTo": "将 {{entry}} 添加到允许的工具。",
     "retry": "权限已保存。重试请求以使用该工具。",
+    "retryButton": "重试",
     "error": "无法更新权限。请重试。",
     "openSettings": "打开设置"
   },

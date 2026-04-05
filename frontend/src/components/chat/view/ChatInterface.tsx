@@ -168,6 +168,7 @@ function ChatInterface({
     handleTranscript,
     handlePermissionDecision,
     handleGrantToolPermission,
+    retryAfterPermission,
     handleInputFocusChange,
     isInputFocused,
   } = useChatComposerState({
@@ -334,6 +335,7 @@ function ChatInterface({
           onFileOpen={onFileOpen}
           onShowSettings={onShowSettings}
           onGrantToolPermission={handleGrantToolPermission}
+          onRetryAfterPermission={retryAfterPermission}
           autoExpandTools={autoExpandTools}
           showRawParameters={showRawParameters}
           showThinking={showThinking}

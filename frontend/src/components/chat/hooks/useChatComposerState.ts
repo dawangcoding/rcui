@@ -912,6 +912,57 @@ export function useChatComposerState({
     [provider],
   );
 
+  const retryAfterPermission = useCallback(() => {
+    if (!selectedProject || isLoading) return;
+
+    const effectiveSessionId =
+      currentSessionId || selectedSession?.id;
+    if (!effectiveSessionId) return;
+
+    const resolvedProjectPath = selectedProject.fullPath || selectedProject.path || '';
+    const retryPrompt = 'Please retry the previously denied command.';
+
+    // Read updated toolsSettings (now includes the newly granted permission)
+    let toolsSettings: Record<string, unknown> = { allowedTools: [], disallowedTools: [], skipPermissions: false };
+    try {
+      const settingsKey = provider === 'cursor' ? 'cursor-tools-settings'
+        : provider === 'codex' ? 'codex-settings'
+        : provider === 'gemini' ? 'gemini-settings'
+        : 'claude-settings';
+      const saved = safeLocalStorage.getItem(settingsKey);
+      if (saved) toolsSettings = JSON.parse(saved);
+    } catch { /* use defaults */ }
+
+    addMessage({ type: 'user', content: retryPrompt, timestamp: new Date() });
+    setIsLoading(true);
+    setCanAbortSession(true);
+    setClaudeStatus({ text: 'Processing', tokens: 0, can_interrupt: true });
+    setIsUserScrolledUp(false);
+    setTimeout(() => scrollToBottom(), 100);
+    onSessionActive?.(effectiveSessionId);
+    onSessionProcessing?.(effectiveSessionId);
+
+    sendMessage({
+      type: 'claude-command',
+      command: retryPrompt,
+      options: {
+        projectPath: resolvedProjectPath,
+        cwd: resolvedProjectPath,
+        sessionId: effectiveSessionId,
+        resume: true,
+        toolsSettings,
+        permissionMode,
+        model: claudeModel,
+      },
+    });
+  }, [
+    selectedProject, isLoading, currentSessionId, selectedSession,
+    provider, addMessage, setIsLoading, setCanAbortSession,
+    setClaudeStatus, setIsUserScrolledUp, scrollToBottom,
+    onSessionActive, onSessionProcessing, sendMessage,
+    permissionMode, claudeModel,
+  ]);
+
   const handlePermissionDecision = useCallback(
     (
       requestIds: string | string[],
@@ -997,6 +1048,7 @@ export function useChatComposerState({
     handleTranscript,
     handlePermissionDecision,
     handleGrantToolPermission,
+    retryAfterPermission,
     handleInputFocusChange,
     isInputFocused,
   };

@@ -303,7 +303,7 @@ export function useChatRealtimeHandlers({
           return [...prev, {
             requestId: msg.requestId,
             toolName: msg.toolName || 'UnknownTool',
-            input: msg.input,
+            input: msg.toolInput ?? msg.input,
             context: msg.context,
             sessionId: sid || null,
             receivedAt: new Date(),

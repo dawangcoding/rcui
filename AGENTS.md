@@ -313,3 +313,211 @@ app.fallback_service(ServeDir::new(static_dir).fallback(ServeFile::new(index_fil
 - 实现 WebSocket chat 命令分发时，参考 query 数据流和控制请求通道
 - 添加新的 session 管理功能时，参考会话持久化 API（listSessions, getSessionMessages 等）
 - 对接 Claude Agent SDK 编程接口时，参考 V1/V2 API 和 Transport 抽象
+
+### Claude CLI 对接规范（必读）
+
+RCUI 的 `spawn_claude()` 直接 spawn `claude` CLI 子进程并通过 stdin/stdout JSON 行进行双向通信，本质上是手动复刻了 `@anthropic-ai/claude-agent-sdk` 内部 `query()` 的行为。**任何涉及 Claude CLI 对接的开发，都必须以 SDK 源码为唯一参考标准**，确保 RCUI 的行为与 SDK 完全一致。
+
+- **SDK 源码位置**: `~/Code/claudecodeui/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs`
+- **原版上层调用**: `~/Code/claudecodeui/server/claude-sdk.js` 中的 `queryClaudeSDK()` 函数
+
+#### 核心原则
+
+> SDK 内部就是 spawn CLI 子进程 + stdin/stdout JSON 行通信。RCUI 做的是同样的事情。
+> 既然本质相同，就不应该有任何行为差异。所有实现细节必须逐项对标 SDK 源码。
+
+**开发流程要求**：
+1. 下方检查清单覆盖的是已知关键项，开发时先按清单逐项确认。
+2. **遇到任何不确定的行为、格式、时序问题，必须回溯 SDK 源码确认**，不要凭猜测实现。
+3. SDK 源码是混淆过的单文件 JS，关键类/函数定位方式：
+   - `cX` — ProcessTransport（CLI 进程 spawn、stdin/stdout 读写、close/endInput）
+   - `pX` — Query 核心（readMessages、handleControlRequest、processControlRequest、streamInput）
+   - `gz` — SDKSession（send、stream、close，多轮会话管理）
+   - `KL` — query() 内部写用户消息到 stdin 的函数
+   - `q$` — JSON.stringify 包装
+   - `s$` — SDK 内部 debug 日志
+   - 搜索 `endInput`、`can_use_tool`、`control_response`、`isSingleUserTurn` 等关键词可快速定位
+4. 如果 SDK 升级了版本，以新版源码为准，同步更新本规范和 RCUI 实现。
+
+#### 1. CLI 启动参数
+
+SDK 内部 `cX.initialize()` 构建的参数列表（RCUI 使用 `claude` 命令需额外加 `--print`）：
+
+```
+claude --print \                          # RCUI 必须加，SDK 用 node cli.js 不需要
+       --output-format stream-json \      # 必须，stdout 输出 JSON 行
+       --input-format stream-json \       # 必须，stdin 接收 JSON 行
+       --permission-prompt-tool stdio \   # 有 canUseTool 回调时必须加
+       --verbose \                        # SDK 默认加
+       [--resume <sessionId>] \           # 恢复会话
+       [--model <model>] \               # 指定模型
+       [--allowedTools <csv>] \           # 预授权工具列表
+       [--disallowedTools <csv>] \        # 禁用工具列表
+       [--dangerously-skip-permissions] \ # bypassPermissions 模式
+       [--permission-mode <mode>]         # 权限模式
+```
+
+#### 2. 环境变量
+
+| 变量 | 值 | 来源 | 说明 |
+|------|-----|------|------|
+| `CLAUDE_CODE_ENTRYPOINT` | `sdk-ts` | SDK 内部设置 | 标识 SDK 模式，启用双向控制协议 |
+| `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` | `1` | 原版 claudecodeui | 禁用实验性功能 |
+| `CLAUDE_CODE_STREAM_CLOSE_TIMEOUT` | `300000` | 原版 claudecodeui | SDK 默认 5 秒太短，原版覆盖为 5 分钟。工具执行（ping、npm install、编译）可能耗时较长，必须设置 |
+
+#### 3. stdin 消息协议
+
+所有消息为单行 JSON + `\n` 换行。启动后按顺序发送：
+
+**消息 1 — 初始化请求（SDK `initialize()` 方法）：**
+```json
+{
+  "type": "control_request",
+  "request_id": "<uuid>",
+  "request": {
+    "subtype": "initialize",
+    "hooks": {},
+    "sdkMcpServers": [],
+    "jsonSchema": null,
+    "systemPrompt": null,
+    "appendSystemPrompt": null,
+    "agents": {},
+    "promptSuggestions": false,
+    "agentProgressSummaries": false
+  }
+}
+```
+
+**消息 2 — 用户消息（SDK `KL()` 函数 / `SDKSession.send()` 方法）：**
+```json
+{
+  "type": "user",
+  "session_id": "",
+  "message": {
+    "role": "user",
+    "content": [{"type": "text", "text": "<用户输入>"}]
+  },
+  "parent_tool_use_id": null
+}
+```
+
+注意：
+- `session_id` 必须包含，值为空字符串 `""`
+- 不包含 `isSynthetic` 字段（SDK 不发此字段）
+- 图片作为 `{"type": "image", "source": {...}}` content block 追加
+
+#### 4. stdout 事件流
+
+CLI stdout 输出单行 JSON 事件，主要类型：
+
+| type | 含义 | 处理方式 |
+|------|------|----------|
+| `system` (subtype: `init`) | CLI 初始化完成，包含 `session_id` | 捕获 session_id，发送 session_created |
+| `stream_event` | 包裹的流式 token 事件 | 解析内部 content_block_start/delta/stop |
+| `assistant` | 完整助手消息（含 content 数组） | 提取 text / tool_use 内容块 |
+| `control_request` (subtype: `can_use_tool`) | 权限请求 | 发送 permission_request 到前端，等待用户决定 |
+| `control_response` | 对我们发送的 control_request 的响应 | init 的 ack 等 |
+| `result` | **回合结束** | 关闭 stdin，等待 CLI 退出 |
+| `keep_alive` | 心跳 | 忽略 |
+
+#### 5. 权限请求/响应协议（can_use_tool）
+
+**CLI → RCUI（stdout）：**
+```json
+{
+  "type": "control_request",
+  "request_id": "<uuid>",
+  "request": {
+    "subtype": "can_use_tool",
+    "tool_name": "Bash",
+    "input": {"command": "ping -c 4 example.com"},
+    "tool_use_id": "<tool_use_id>",
+    ...
+  }
+}
+```
+
+**RCUI → CLI（stdin），SDK `handleControlRequest()` 方法：**
+```json
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "<匹配的 request_id>",
+    "response": {
+      "behavior": "allow",
+      "toolUseID": "<tool_use_id>",
+      "updatedInput": { ... }
+    }
+  }
+}
+```
+
+或拒绝：
+```json
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "<匹配的 request_id>",
+    "response": {
+      "behavior": "deny",
+      "toolUseID": "<tool_use_id>",
+      "message": "User denied tool use"
+    }
+  }
+}
+```
+
+关键实现点：
+- `request_id` 必须从请求中原样返回
+- `toolUseID` 必须从请求的 `tool_use_id` 字段提取并包含在响应中
+- 使用 `PENDING_TOOL_USE_IDS` DashMap 存储 `request_id → tool_use_id` 映射
+
+#### 6. 回合结束与进程生命周期
+
+SDK 内部 `readMessages()` 方法的处理逻辑：
+
+```
+收到 result 事件
+  → isSingleUserTurn ? transport.endInput() : 继续等待
+  → endInput() 关闭 stdin
+  → CLI 收到 EOF 后退出
+  → stdout 到达 EOF
+  → readMessages 循环结束
+  → 调用 cleanup()
+```
+
+RCUI 必须复刻相同行为：
+
+1. 收到 `result` 事件后，设置 `ActiveSession.stdin_tx = None`（等价于 SDK 的 `endInput()`）
+2. **不要 break** — 继续读取 stdout 直到 CLI 自然退出（EOF）
+3. 5 秒超时兜底（如果 CLI 未退出，超时后 break → DashMap remove → `kill_on_drop`）
+4. 移除 DashMap 条目，发送 `complete` 到前端
+
+**绝对不要**在收到 result 后直接 break + SIGKILL，这与 SDK 行为不一致。
+
+#### 7. 进程清理（SDK `close()` 方法）
+
+SDK 的 `ProcessTransport.close()` 实现了分级终止：
+
+```
+stdin.end()          → 关闭 stdin
+等待 2 秒 (LM=2000)  → SIGTERM
+再等 5 秒            → SIGKILL
+```
+
+RCUI 中 `kill_on_drop(true)` 会在 Child drop 时发送 SIGKILL，作为最后兜底。正常流程应该是 stdin 关闭 → CLI 自然退出。
+
+#### 8. 对照检查清单
+
+开发或修改 Claude CLI 对接功能时，逐项检查：
+
+- [ ] CLI 参数是否与 SDK `cX.initialize()` 一致？
+- [ ] 环境变量是否包含 `CLAUDE_CODE_ENTRYPOINT=sdk-ts`、`CLAUDE_CODE_STREAM_CLOSE_TIMEOUT=300000`？
+- [ ] stdin 初始化消息格式是否与 SDK `initialize()` 一致？
+- [ ] 用户消息格式是否包含 `session_id: ""`、不包含 `isSynthetic`？
+- [ ] control_response 是否包含 `toolUseID`、`request_id`，subtype 是否为 `success`？
+- [ ] result 事件后是否关闭 stdin 而非直接 break？
+- [ ] 进程终止是否遵循 stdin 关闭 → 等待退出 → 超时兜底？
+- [ ] 超时时间是否合理？（result 后 5 秒，正常 120 秒）

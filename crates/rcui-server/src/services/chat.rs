@@ -1,14 +1,23 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use base64::Engine;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::state::AppState;
+
+/// Maps `request_id` → `(tool_use_id, original_input)` for pending can_use_tool
+/// control requests.  Populated when CLI sends a can_use_tool request, consumed
+/// when we send the response.  The original input is kept so we can always
+/// provide `updatedInput` in the allow response (CLI Zod schema requires it).
+static PENDING_TOOL_USE_IDS: LazyLock<DashMap<String, (String, Value)>> =
+    LazyLock::new(DashMap::new);
 
 /// Generate a unique message ID for WebSocket messages.
 fn gen_msg_id() -> String {
@@ -457,24 +466,50 @@ pub async fn execute_command(
                 if let Some(entry) = state.active_sessions.get(&key) {
                     let session = entry.lock().await;
                     if let Some(ref stdin_tx) = session.stdin_tx {
-                        // Build the permission response JSON for Claude CLI stdin.
-                        let mut response = json!({
-                            "type": "permission_response",
-                            "requestId": request_id,
-                            "result": if allow { "allow" } else { "deny" },
+                        // Retrieve the (tool_use_id, original_input) saved when
+                        // the can_use_tool request arrived.
+                        let (tool_use_id, original_input) = PENDING_TOOL_USE_IDS
+                            .remove(&request_id)
+                            .map(|(_, v)| v)
+                            .unwrap_or_default();
+
+                        // Build SDK control_response for the can_use_tool request.
+                        // CLI Zod schema requires `updatedInput` (record) for allow,
+                        // and `message` (string) for deny — both are mandatory.
+                        // Match SDK behaviour: `updatedInput ?? original_input`.
+                        let inner_response = if allow {
+                            let final_input = updated_input.unwrap_or(original_input);
+                            let mut r = json!({
+                                "behavior": "allow",
+                                "updatedInput": final_input,
+                            });
+                            if !tool_use_id.is_empty() {
+                                r.as_object_mut().unwrap()
+                                    .insert("toolUseID".to_string(), json!(tool_use_id));
+                            }
+                            r
+                        } else {
+                            let deny_msg = message.unwrap_or_else(|| "User denied tool use".to_string());
+                            let mut r = json!({
+                                "behavior": "deny",
+                                "message": deny_msg,
+                            });
+                            if !tool_use_id.is_empty() {
+                                r.as_object_mut().unwrap()
+                                    .insert("toolUseID".to_string(), json!(tool_use_id));
+                            }
+                            r
+                        };
+
+                        let response = json!({
+                            "type": "control_response",
+                            "response": {
+                                "subtype": "success",
+                                "request_id": request_id,
+                                "response": inner_response,
+                            }
                         });
-                        if let Some(input) = updated_input {
-                            response
-                                .as_object_mut()
-                                .unwrap()
-                                .insert("updatedInput".to_string(), input);
-                        }
-                        if let Some(msg) = message {
-                            response
-                                .as_object_mut()
-                                .unwrap()
-                                .insert("message".to_string(), json!(msg));
-                        }
+                        info!(%request_id, %allow, response = %response, "Sending control_response to CLI");
                         let _ = stdin_tx.send(response.to_string());
                     } else {
                         warn!(%request_id, "No stdin channel for Claude session");
@@ -485,6 +520,79 @@ pub async fn execute_command(
             }
         }
     }
+}
+
+// ─── SDK Protocol Helpers ───────────────────────────────────────────────────
+
+/// Send the SDK initialize control request via stdin.
+/// This must be the first message sent to the CLI in SDK mode.
+fn send_sdk_init(stdin_tx: &mpsc::UnboundedSender<String>) {
+    let init_request = json!({
+        "type": "control_request",
+        "request_id": Uuid::new_v4().to_string(),
+        "request": {
+            "subtype": "initialize",
+            "hooks": {},
+            "sdkMcpServers": [],
+            "jsonSchema": null,
+            "systemPrompt": null,
+            "appendSystemPrompt": null,
+            "agents": {},
+            "promptSuggestions": false,
+            "agentProgressSummaries": false
+        }
+    });
+    let _ = stdin_tx.send(init_request.to_string());
+}
+
+/// Send an SDKUserMessage via stdin.
+/// Call after send_sdk_init(). For resumed sessions, only call this if
+/// the user actually typed a new message (non-empty prompt).
+fn send_sdk_user_message(
+    stdin_tx: &mpsc::UnboundedSender<String>,
+    prompt: &str,
+    images: &Option<Vec<Value>>,
+) {
+    let mut content_blocks = vec![json!({
+        "type": "text",
+        "text": prompt
+    })];
+
+    // Add image content blocks if present
+    if let Some(imgs) = images {
+        for img in imgs {
+            if let Some(data_uri) = img.get("data").and_then(|v| v.as_str()) {
+                // Parse data URI: "data:<mime>;base64,<data>"
+                if let Some(comma_pos) = data_uri.find(',') {
+                    let header = &data_uri[..comma_pos];
+                    let raw_base64 = &data_uri[comma_pos + 1..];
+                    let media_type = header
+                        .strip_prefix("data:")
+                        .and_then(|h| h.strip_suffix(";base64"))
+                        .unwrap_or("image/png");
+                    content_blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": raw_base64
+                        }
+                    }));
+                }
+            }
+        }
+    }
+
+    let user_message = json!({
+        "type": "user",
+        "session_id": "",
+        "message": {
+            "role": "user",
+            "content": content_blocks
+        },
+        "parent_tool_use_id": null
+    });
+    let _ = stdin_tx.send(user_message.to_string());
 }
 
 // ─── Claude CLI Spawner ─────────────────────────────────────────────────────
@@ -518,12 +626,20 @@ async fn spawn_claude(
         None => prompt,
     };
 
+    // SDK mode: prompt is sent via stdin as SDKUserMessage, not via positional arg.
+    // --print is required for --output-format and --input-format to take effect.
+    // --input-format stream-json enables bidirectional JSON communication via stdin.
+    // --permission-prompt-tool stdio tells CLI to send can_use_tool control requests
+    // via stdout instead of auto-denying permissions.
     let mut args: Vec<String> = vec![
+        "--print".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--permission-prompt-tool".to_string(),
+        "stdio".to_string(),
         "--verbose".to_string(),
-        "-p".to_string(),
-        final_prompt,
     ];
 
     if let Some(ref sid) = opts.session_id {
@@ -584,7 +700,12 @@ async fn spawn_claude(
     let result = Command::new("claude")
         .args(&args)
         .current_dir(cwd)
+        .env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")
         .env("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
+        // SDK default stream-close timeout is 5s, far too short for tools like
+        // Bash (ping, build, etc.) that may run for minutes.  The original
+        // Node.js implementation overrides this to 300 000 ms (5 min).
+        .env("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "300000")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -643,8 +764,27 @@ async fn spawn_claude(
         None
     };
 
-    // Register active session
+    // Send SDK initialize + user prompt via stdin.
+    // For resumed sessions, the CLI loads history from disk; only send
+    // a user message if the user actually typed something new.
+    let is_resume = opts.resume.unwrap_or(false) && opts.session_id.is_some();
+    if let Some(ref stx) = stdin_tx {
+        send_sdk_init(stx);
+        if !final_prompt.trim().is_empty() {
+            send_sdk_user_message(stx, &final_prompt, &opts.images);
+            info!(provider, is_resume, "SDK init + user message sent via stdin");
+        } else {
+            info!(provider, is_resume, "SDK init sent via stdin (no user message for resume)");
+        }
+    }
+
+    // Register active session — remove any stale pending entry first to avoid
+    // triggering its abort_rx when the DashMap slot is replaced.
     let session_key = format!("{provider}:pending");
+    if state.active_sessions.contains_key(&session_key) {
+        debug!(provider, "Removing stale pending session before registering new one");
+        state.active_sessions.remove(&session_key);
+    }
     let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel();
     state.active_sessions.insert(
         session_key.clone(),
@@ -660,6 +800,7 @@ async fn spawn_claude(
     let mut lines = reader.lines();
     let mut last_activity = tokio::time::Instant::now();
     let mut tracker = ClaudeStreamTracker::new();
+    let mut result_received = false;
 
     loop {
         tokio::select! {
@@ -673,6 +814,10 @@ async fn spawn_claude(
                         }
 
                         if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+                            // Log EVERY event from CLI stdout at info level for debugging
+                            let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("(none)");
+                            info!(provider, %session_id, %etype, raw = %trimmed, "CLI stdout line");
+
                             let parsed = parse_claude_stream_event(&event, &session_id, &mut tracker);
 
                             // Capture session ID from first event
@@ -693,6 +838,30 @@ async fn spawn_claude(
 
                             for msg in parsed {
                                 let _ = tx.send(msg);
+                            }
+
+                            // In SDK mode, the CLI doesn't exit after a single turn —
+                            // it waits for the next SDKUserMessage on stdin.  When we
+                            // receive a "result" event (end of a turn), close stdin so
+                            // the CLI receives EOF and exits naturally — matching the
+                            // SDK's `transport.endInput()` behaviour.
+                            if etype == "result" {
+                                info!(provider, %session_id, "Result event received, closing stdin");
+                                result_received = true;
+                                last_activity = tokio::time::Instant::now();
+                                let rk = if session_id.is_empty() {
+                                    session_key.clone()
+                                } else {
+                                    format!("{provider}:{session_id}")
+                                };
+                                if let Some(session_ref) = state.active_sessions.get(&rk) {
+                                    let session_arc = session_ref.clone();
+                                    drop(session_ref); // release DashMap shard lock
+                                    let mut sess = session_arc.lock().await;
+                                    sess.stdin_tx = None; // close stdin → CLI receives EOF
+                                }
+                                // Don't break — let the loop drain remaining stdout
+                                // until the CLI process exits and we hit Ok(None) / EOF.
                             }
                         } else {
                             // Non-JSON line: treat as raw text
@@ -722,13 +891,23 @@ async fn spawn_claude(
                 schedule_temp_image_cleanup(temp_dir);
                 return;
             }
-            _ = tokio::time::sleep_until(last_activity + INACTIVITY_TIMEOUT) => {
-                warn!(provider, %session_id, "Session timed out (120s inactivity)");
-                let _ = tx.send(ChatResponse::error(
-                    "Session timed out (120s inactivity)",
-                    Some(&session_id),
-                    provider,
-                ));
+            _ = tokio::time::sleep_until(last_activity + if result_received {
+                // After result, give CLI up to 5s to exit after stdin close,
+                // matching the SDK's close() grace period (2s SIGTERM + 5s SIGKILL).
+                std::time::Duration::from_secs(5)
+            } else {
+                INACTIVITY_TIMEOUT
+            }) => {
+                if result_received {
+                    debug!(provider, %session_id, "CLI exit grace period elapsed after result");
+                } else {
+                    warn!(provider, %session_id, "Session timed out (120s inactivity)");
+                    let _ = tx.send(ChatResponse::error(
+                        "Session timed out (120s inactivity)",
+                        Some(&session_id),
+                        provider,
+                    ));
+                }
                 break;
             }
         }
@@ -1003,9 +1182,15 @@ fn parse_claude_stream_event(
             });
         }
         "result" => {
-            // Final result message
+            // Final result message — may be success or error from CLI.
+            let is_error = event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
             if let Some(result_text) = event.get("result").and_then(|v| v.as_str()) {
-                msgs.push(ChatResponse::stream_delta(result_text, session_id, provider));
+                if is_error {
+                    warn!(provider, %session_id, %result_text, "CLI result error");
+                    msgs.push(ChatResponse::error(result_text, Some(session_id), provider));
+                } else if !result_text.is_empty() {
+                    msgs.push(ChatResponse::stream_delta(result_text, session_id, provider));
+                }
             }
         }
         // Permission request events from Claude CLI stream-json.
@@ -1106,6 +1291,62 @@ fn parse_claude_stream_event(
                 _ => {
                     debug!(provider, %session_id, %subtype, "System event");
                 }
+            }
+        }
+        // SDK protocol: CLI sends control_request when it needs permission to use a tool.
+        // The CLI blocks until we respond with a control_response via stdin.
+        "control_request" => {
+            let request = event.get("request");
+            let subtype = request
+                .and_then(|r| r.get("subtype"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let request_id = event
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if subtype == "can_use_tool" {
+                let tool_name = request
+                    .and_then(|r| r.get("tool_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let input = request
+                    .and_then(|r| r.get("input"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let tool_use_id = request
+                    .and_then(|r| r.get("tool_use_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if !request_id.is_empty() {
+                    // Store tool_use_id + original input for the control_response.
+                    // The original input is needed because CLI's Zod schema requires
+                    // `updatedInput` in the allow response; if the user doesn't modify
+                    // it we fall back to the original (matching SDK behaviour).
+                    if !tool_use_id.is_empty() {
+                        PENDING_TOOL_USE_IDS
+                            .insert(request_id.to_string(), (tool_use_id.to_string(), input.clone()));
+                    }
+                    info!(provider, %session_id, %request_id, %tool_name, %tool_use_id, "SDK can_use_tool request");
+                    msgs.push(ChatResponse::permission_request(
+                        request_id, tool_name, input, session_id,
+                    ));
+                }
+            } else {
+                debug!(provider, %session_id, %subtype, "Ignoring control_request subtype");
+            }
+        }
+        // SDK protocol: CLI's response to our initialize control_request.
+        "control_response" => {
+            debug!(provider, %session_id, "control_response received (init ack)");
+        }
+        // SDK protocol: streaming token events may be wrapped in stream_event envelope.
+        "stream_event" => {
+            if let Some(inner) = event.get("event") {
+                let inner_parsed = parse_claude_stream_event(inner, session_id, tracker);
+                msgs.extend(inner_parsed);
             }
         }
         _ => {

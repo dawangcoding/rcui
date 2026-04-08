@@ -60,8 +60,8 @@
     "instructionDetail": "在 CLI 中，您可以使用方向键或输入数字来交互式地选择此选项。"
   },
   "thinking": {
-    "title": "思考中...",
-    "emoji": "💭 思考中..."
+    "title": "思考过程",
+    "emoji": "💭 思考过程"
   },
   "json": {
     "response": "JSON 响应"

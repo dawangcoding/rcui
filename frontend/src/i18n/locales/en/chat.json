@@ -60,8 +60,8 @@
     "instructionDetail": "In the CLI, you would select this option interactively using arrow keys or by typing the number."
   },
   "thinking": {
-    "title": "Thinking...",
-    "emoji": "💭 Thinking..."
+    "title": "Thought process",
+    "emoji": "💭 Thought process"
   },
   "json": {
     "response": "JSON Response"

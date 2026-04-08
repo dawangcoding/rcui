@@ -204,6 +204,31 @@ const createDefaultNotificationPreferences = (): NotificationPreferencesState =>
   },
 });
 
+const normalizeNotificationPreferences = (raw: unknown): NotificationPreferencesState => {
+  const defaults = createDefaultNotificationPreferences();
+  if (!raw || typeof raw !== 'object') {
+    return defaults;
+  }
+  const obj = raw as Record<string, unknown>;
+  const channels = obj.channels && typeof obj.channels === 'object'
+    ? (obj.channels as Record<string, unknown>)
+    : {};
+  const events = obj.events && typeof obj.events === 'object'
+    ? (obj.events as Record<string, unknown>)
+    : {};
+  return {
+    channels: {
+      inApp: typeof channels.inApp === 'boolean' ? channels.inApp : defaults.channels.inApp,
+      webPush: typeof channels.webPush === 'boolean' ? channels.webPush : defaults.channels.webPush,
+    },
+    events: {
+      actionRequired: typeof events.actionRequired === 'boolean' ? events.actionRequired : defaults.events.actionRequired,
+      stop: typeof events.stop === 'boolean' ? events.stop : defaults.events.stop,
+      error: typeof events.error === 'boolean' ? events.error : defaults.events.error,
+    },
+  };
+};
+
 export function useSettingsController({ isOpen, initialTab, projects, onClose }: UseSettingsControllerArgs) {
   const { isDarkMode, toggleDarkMode } = useTheme() as ThemeContextValue;
   const closeTimerRef = useRef<number | null>(null);
@@ -696,7 +721,7 @@ export function useSettingsController({ isOpen, initialTab, projects, onClose }:
         if (notificationResponse.ok) {
           const notificationData = await toResponseJson<NotificationPreferencesResponse>(notificationResponse);
           if (notificationData.success && notificationData.preferences) {
-            setNotificationPreferences(notificationData.preferences);
+            setNotificationPreferences(normalizeNotificationPreferences(notificationData.preferences));
           } else {
             setNotificationPreferences(createDefaultNotificationPreferences());
           }

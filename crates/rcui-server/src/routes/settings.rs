@@ -177,7 +177,11 @@ pub async fn get_notification_preferences(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, AppError> {
     let prefs = db::notifications::get_preferences(&state.db, auth.user_id).await?;
-    Ok(Json(json!({ "success": true, "preferences": prefs })))
+    let prefs_value: Value = match prefs {
+        Some(json_str) => serde_json::from_str(&json_str).unwrap_or(Value::Null),
+        None => Value::Null,
+    };
+    Ok(Json(json!({ "success": true, "preferences": prefs_value })))
 }
 
 pub async fn update_notification_preferences(
@@ -186,8 +190,8 @@ pub async fn update_notification_preferences(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
     let prefs_json = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
-    let prefs = db::notifications::update_preferences(&state.db, auth.user_id, &prefs_json).await?;
-    Ok(Json(json!({ "success": true, "preferences": prefs })))
+    db::notifications::update_preferences(&state.db, auth.user_id, &prefs_json).await?;
+    Ok(Json(json!({ "success": true, "preferences": body })))
 }
 
 // ─── Push Subscriptions ──────────────────────────────────────────────────────

@@ -129,6 +129,20 @@ pub struct CommitRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InitialCommitRequest {
+    pub project: String,
+    #[serde(default = "default_initial_commit_message")]
+    pub message: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+fn default_initial_commit_message() -> String {
+    "Initial commit".to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BranchRequest {
     pub project: String,
     pub branch: String,
@@ -269,7 +283,7 @@ pub async fn file_with_diff(
 /// POST /api/git/initial-commit
 pub async fn initial_commit(
     _auth: AuthUser,
-    Json(body): Json<CommitRequest>,
+    Json(body): Json<InitialCommitRequest>,
 ) -> Result<Json<Value>, AppError> {
     let path = resolve_project_path(&body.project).await?;
 
@@ -282,7 +296,13 @@ pub async fn initial_commit(
         }
     }
 
-    let output = run_git(&path, &["commit", "-m", &body.message]).await?;
+    let message = if body.message.trim().is_empty() {
+        "Initial commit".to_string()
+    } else {
+        body.message
+    };
+
+    let output = run_git(&path, &["commit", "-m", &message]).await?;
     Ok(Json(json!({ "success": true, "output": output })))
 }
 

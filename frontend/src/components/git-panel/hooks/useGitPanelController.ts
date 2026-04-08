@@ -613,6 +613,7 @@ export function useGitPanelController({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project: selectedProject.name,
+          message: 'Initial commit',
         }),
       });
 

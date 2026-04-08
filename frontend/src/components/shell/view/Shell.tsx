@@ -47,6 +47,7 @@ export default function Shell({
   const [cliPromptOptions, setCliPromptOptions] = useState<CliPromptOption[] | null>(null);
   const promptCheckTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onOutputRef = useRef<(() => void) | null>(null);
+  const pendingRestartConnectRef = useRef(false);
 
   const {
     terminalContainerRef,
@@ -190,11 +191,20 @@ export default function Shell({
   );
 
   const handleRestartShell = useCallback(() => {
+    pendingRestartConnectRef.current = true;
     setIsRestarting(true);
     window.setTimeout(() => {
       setIsRestarting(false);
     }, SHELL_RESTART_DELAY_MS);
   }, []);
+
+  // Auto-connect after restart completes (terminal re-initialized)
+  useEffect(() => {
+    if (pendingRestartConnectRef.current && isInitialized && !isRestarting && !isConnected && !isConnecting) {
+      pendingRestartConnectRef.current = false;
+      connectToShell();
+    }
+  }, [isInitialized, isRestarting, isConnected, isConnecting, connectToShell]);
 
   if (!selectedProject) {
     return (
@@ -263,7 +273,7 @@ export default function Shell({
         disconnectTitle={t('shell.actions.disconnectTitle')}
         restartLabel={t('shell.actions.restart')}
         restartTitle={t('shell.actions.restartTitle')}
-        disableRestart={isRestarting || isConnected}
+        disableRestart={isRestarting}
       />
 
       <div className="relative flex-1 overflow-hidden p-2">
